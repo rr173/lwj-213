@@ -8,6 +8,16 @@ let trafficFlows = [];
 let packets = [];
 let congestionStates = new Map();
 
+let faultStats = {
+    disabledLinkCount: 0,
+    totalFaultCount: 0,
+    pathSwitchCount: 0,
+    pausedFlowCount: 0
+};
+
+let batchFaultMode = false;
+let batchFaultChanged = false;
+
 let selectedDevice = null;
 let selectedLink = null;
 let draggedDevice = null;
@@ -47,6 +57,7 @@ function init() {
     
     updateDeviceCount();
     updateDeviceSelects();
+    updateFaultStats();
     
     requestAnimationFrame(animate);
 }
@@ -276,6 +287,10 @@ function deleteDevice(deviceId) {
     const deviceIndex = devices.findIndex(d => d.id === deviceId);
     if (deviceIndex === -1) return;
     
+    const removedLinks = links.filter(l => l.from === deviceId || l.to === deviceId);
+    const disabledRemovedCount = removedLinks.filter(l => !l.enabled).length;
+    faultStats.disabledLinkCount -= disabledRemovedCount;
+    
     links = links.filter(l => l.from !== deviceId && l.to !== deviceId);
     
     manualRoutes = manualRoutes.filter(r => r.src !== deviceId && r.dst !== deviceId);
@@ -283,7 +298,7 @@ function deleteDevice(deviceId) {
     devices.splice(deviceIndex, 1);
     
     trafficFlows = trafficFlows.filter(f => f.srcId !== deviceId && f.dstId !== deviceId);
-    packets = packets.filter(p => p.srcId !== deviceId && p.dstId !== deviceId);
+    packets = packets.filter(p => p.srcId !== deviceId || p.dstId !== deviceId);
     
     if (selectedDevice && selectedDevice.id === deviceId) {
         selectedDevice = null;
@@ -293,7 +308,9 @@ function deleteDevice(deviceId) {
     updateDeviceCount();
     updateDeviceSelects();
     recalculateRoutes();
+    rerouteAffectedFlows();
     updateTrafficList();
+    updateFaultStats();
 }
 
 function getDeviceAt(x, y) {
@@ -366,7 +383,8 @@ function addLink(fromId, toId, bandwidth, delay) {
         from: fromId,
         to: toId,
         bandwidth: bandwidth,
-        delay: delay
+        delay: delay,
+        enabled: true
     };
     
     links.push(link);
@@ -376,6 +394,11 @@ function addLink(fromId, toId, bandwidth, delay) {
 }
 
 function deleteLink(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (link && !link.enabled) {
+        faultStats.disabledLinkCount--;
+    }
+    
     links = links.filter(l => l.id !== linkId);
     
     if (selectedLink && selectedLink.id === linkId) {
@@ -384,11 +407,192 @@ function deleteLink(linkId) {
     }
     
     recalculateRoutes();
+    updateFaultStats();
+}
+
+function toggleLinkEnabled(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (!link) return;
+    
+    link.enabled = !link.enabled;
+    
+    if (link.enabled) {
+        faultStats.disabledLinkCount--;
+    } else {
+        faultStats.disabledLinkCount++;
+        faultStats.totalFaultCount++;
+    }
+    
+    if (batchFaultMode) {
+        batchFaultChanged = true;
+        updatePropertyPanel();
+        updateFaultStats();
+        return;
+    }
+    
+    handleLinkStateChange();
+}
+
+function handleLinkStateChange() {
+    recalculateRoutes();
+    rerouteAffectedFlows();
+    updatePropertyPanel();
+    updateFaultStats();
+}
+
+function getPathNodeNames(path) {
+    if (!path || !path.nodes) return '';
+    return path.nodes.map(id => getDeviceName(id)).join(' → ');
+}
+
+function rerouteAffectedFlows() {
+    trafficFlows.forEach(flow => {
+        if (flow.completed) return;
+        
+        const currentPath = flow.path;
+        
+        if (!currentPath || !currentPath.segments || currentPath.segments.length === 0) {
+            if (flow.paused) {
+                const newPath = getPath(flow.srcId, flow.dstId);
+                if (newPath) {
+                    flow.path = newPath;
+                    flow.paused = false;
+                    flow.pauseReason = null;
+                    addLog(`流量${flow.id}恢复`, 'success');
+                    faultStats.pathSwitchCount++;
+                }
+            }
+            return;
+        }
+        
+        const hasDisabledLink = currentPath.segments.some(seg => {
+            const link = links.find(l => l.id === seg.link.id);
+            return !link || !link.enabled;
+        });
+        
+        if (hasDisabledLink || flow.paused) {
+            const newPath = getPath(flow.srcId, flow.dstId);
+            
+            if (newPath) {
+                const oldPathStr = getPathNodeNames(currentPath);
+                const newPathStr = getPathNodeNames(newPath);
+                
+                flow.path = newPath;
+                
+                if (flow.paused) {
+                    flow.paused = false;
+                    flow.pauseReason = null;
+                    addLog(`流量${flow.id}恢复`, 'success');
+                } else {
+                    addLog(`流量${flow.id}路径切换: ${oldPathStr} -> ${newPathStr}`, 'warning');
+                }
+                
+                faultStats.pathSwitchCount++;
+                
+                packets.forEach(packet => {
+                    if (packet.flowId === flow.id && !packet.completed && !packet.isLost) {
+                        packet.path = newPath;
+                        if (packet.currentSegment >= newPath.segments.length) {
+                            packet.currentSegment = 0;
+                            packet.progress = 0;
+                        }
+                        updatePacketSpeed(packet);
+                    }
+                });
+            } else {
+                if (!flow.paused) {
+                    flow.paused = true;
+                    flow.pauseReason = 'no_route';
+                    faultStats.pausedFlowCount++;
+                    addLog(`流量${flow.id}暂停: 无可用路径`, 'error');
+                }
+            }
+        } else {
+            const newPath = getPath(flow.srcId, flow.dstId);
+            if (newPath && newPath.totalDelay < currentPath.totalDelay) {
+                const oldPathStr = getPathNodeNames(currentPath);
+                const newPathStr = getPathNodeNames(newPath);
+                
+                flow.path = newPath;
+                addLog(`流量${flow.id}路径切换: ${oldPathStr} -> ${newPathStr}`, 'info');
+                faultStats.pathSwitchCount++;
+                
+                packets.forEach(packet => {
+                    if (packet.flowId === flow.id && !packet.completed && !packet.isLost) {
+                        packet.path = newPath;
+                        if (packet.currentSegment >= newPath.segments.length) {
+                            packet.currentSegment = 0;
+                            packet.progress = 0;
+                        }
+                        updatePacketSpeed(packet);
+                    }
+                });
+            }
+        }
+    });
+    
+    updateTrafficList();
+    updateLinkCongestion();
+}
+
+function restoreAllLinks() {
+    let hasRestored = false;
+    
+    links.forEach(link => {
+        if (!link.enabled) {
+            link.enabled = true;
+            hasRestored = true;
+        }
+    });
+    
+    faultStats.disabledLinkCount = 0;
+    
+    if (hasRestored) {
+        handleLinkStateChange();
+        addLog('所有链路已恢复', 'success');
+    }
+}
+
+function startBatchFault() {
+    batchFaultMode = true;
+    batchFaultChanged = false;
+    updateBatchFaultUI();
+}
+
+function endBatchFault() {
+    batchFaultMode = false;
+    if (batchFaultChanged) {
+        handleLinkStateChange();
+        batchFaultChanged = false;
+    }
+    updateBatchFaultUI();
+}
+
+function toggleBatchFaultMode() {
+    if (batchFaultMode) {
+        endBatchFault();
+    } else {
+        startBatchFault();
+    }
+}
+
+function updateBatchFaultUI() {
+    const btn = document.getElementById('batchFaultBtn');
+    const hint = document.getElementById('batchFaultHint');
+    
+    if (btn) {
+        btn.textContent = batchFaultMode ? '应用' : '批量模式';
+        btn.classList.toggle('btn-primary', batchFaultMode);
+    }
+    
+    if (hint) {
+        hint.style.display = batchFaultMode ? 'block' : 'none';
+    }
 }
 
 function getLinkLoad(linkId) {
     const link = links.find(l => l.id === linkId);
-    if (!link) return 0;
+    if (!link || !link.enabled) return 0;
     
     let totalRate = 0;
     trafficFlows.forEach(flow => {
@@ -452,6 +656,7 @@ function dijkstra(srcId) {
 function getNeighbors(deviceId) {
     const neighbors = [];
     links.forEach(link => {
+        if (!link.enabled) return;
         if (link.from === deviceId) {
             neighbors.push({ nodeId: link.to, delay: link.delay });
         } else if (link.to === deviceId) {
@@ -485,7 +690,7 @@ function getPath(srcId, dstId) {
     const segments = [];
     for (let i = 0; i < path.length - 1; i++) {
         const link = findLink(path[i], path[i + 1]);
-        if (link) {
+        if (link && link.enabled) {
             segments.push({
                 from: path[i],
                 to: path[i + 1],
@@ -504,7 +709,7 @@ function getPath(srcId, dstId) {
 
 function getPathWithNextHop(srcId, dstId, nextHopId) {
     const link = findLink(srcId, nextHopId);
-    if (!link) {
+    if (!link || !link.enabled) {
         return getPath(srcId, dstId);
     }
     
@@ -526,7 +731,7 @@ function getPathWithNextHop(srcId, dstId, nextHopId) {
     const segments = [];
     for (let i = 0; i < path.length - 1; i++) {
         const segLink = findLink(path[i], path[i + 1]);
-        if (segLink) {
+        if (segLink && segLink.enabled) {
             segments.push({
                 from: path[i],
                 to: path[i + 1],
@@ -606,7 +811,7 @@ function updateLinkCongestion() {
     });
     
     trafficFlows.forEach(flow => {
-        if (!flow.path || flow.completed) return;
+        if (!flow.path || flow.completed || flow.paused) return;
         
         flow.actualRate = flow.rate;
         
@@ -653,7 +858,7 @@ function updateLinkCongestion() {
 
 function spawnPackets(deltaTime) {
     trafficFlows.forEach(flow => {
-        if (flow.completed || !flow.path) return;
+        if (flow.completed || !flow.path || flow.paused) return;
         
         const bytesPerMs = (flow.actualRate / 8) / 1000;
         flow.sent += bytesPerMs * deltaTime;
@@ -957,22 +1162,27 @@ function drawLink(link) {
     const to = devices.find(d => d.id === link.to);
     if (!from || !to) return;
     
-    const loadRatio = getLinkLoad(link.id);
-    const congestionState = congestionStates.get(link.id);
-    
     let lineWidth = 2 + (link.bandwidth / 10000) * 6;
     let color = '#52c41a';
+    let isDisabled = !link.enabled;
     
-    if (loadRatio > 0.85) {
-        color = '#ff4d4f';
-    } else if (loadRatio > 0.6) {
-        color = '#faad14';
-    }
-    
-    if (congestionState) {
-        const flash = Math.sin(Date.now() / 100) > 0;
-        if (flash) {
-            color = '#ff0000';
+    if (isDisabled) {
+        color = '#bfbfbf';
+    } else {
+        const loadRatio = getLinkLoad(link.id);
+        const congestionState = congestionStates.get(link.id);
+        
+        if (loadRatio > 0.85) {
+            color = '#ff4d4f';
+        } else if (loadRatio > 0.6) {
+            color = '#faad14';
+        }
+        
+        if (congestionState) {
+            const flash = Math.sin(Date.now() / 100) > 0;
+            if (flash) {
+                color = '#ff0000';
+            }
         }
     }
     
@@ -984,26 +1194,34 @@ function drawLink(link) {
     ctx.lineWidth = lineWidth;
     ctx.lineCap = 'round';
     
+    if (isDisabled) {
+        ctx.setLineDash([8, 6]);
+    }
+    
     ctx.beginPath();
     ctx.moveTo(from.x, from.y);
     ctx.lineTo(to.x, to.y);
     ctx.stroke();
     
+    if (isDisabled) {
+        ctx.setLineDash([]);
+    }
+    
     const midX = (from.x + to.x) / 2;
     const midY = (from.y + to.y) / 2;
     
     ctx.fillStyle = '#fff';
-    ctx.strokeStyle = '#999';
+    ctx.strokeStyle = isDisabled ? '#d9d9d9' : '#999';
     ctx.lineWidth = 1;
     
-    const label = `${link.bandwidth}Mbps/${link.delay}ms`;
+    const label = isDisabled ? '已禁用' : `${link.bandwidth}Mbps/${link.delay}ms`;
     ctx.font = '10px -apple-system, sans-serif';
     const textWidth = ctx.measureText(label).width;
     
     ctx.fillRect(midX - textWidth/2 - 4, midY - 7, textWidth + 8, 14);
     ctx.strokeRect(midX - textWidth/2 - 4, midY - 7, textWidth + 8, 14);
     
-    ctx.fillStyle = '#666';
+    ctx.fillStyle = isDisabled ? '#bfbfbf' : '#666';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(label, midX, midY);
@@ -1119,6 +1337,10 @@ function setupUIEvents() {
     document.getElementById('importBtn').addEventListener('click', () => {
         document.getElementById('importFile').click();
     });
+    
+    document.getElementById('restoreAllBtn').addEventListener('click', restoreAllLinks);
+    
+    document.getElementById('batchFaultBtn').addEventListener('click', toggleBatchFaultMode);
     
     document.getElementById('importFile').addEventListener('change', importTopology);
 }
@@ -1271,6 +1493,7 @@ function updatePropertyPanel() {
         const fromDevice = devices.find(d => d.id === selectedLink.from);
         const toDevice = devices.find(d => d.id === selectedLink.to);
         const loadRatio = (getLinkLoad(selectedLink.id) * 100).toFixed(1);
+        const isEnabled = selectedLink.enabled;
         
         panel.innerHTML = `
             <div class="prop-row">
@@ -1287,15 +1510,26 @@ function updatePropertyPanel() {
             </div>
             <div class="prop-row">
                 <span class="prop-label">带宽 (Mbps)</span>
-                <input type="number" id="propBandwidth" value="${selectedLink.bandwidth}" class="prop-input" min="1" max="10000">
+                <input type="number" id="propBandwidth" value="${selectedLink.bandwidth}" class="prop-input" min="1" max="10000" ${isEnabled ? '' : 'disabled'}>
             </div>
             <div class="prop-row">
                 <span class="prop-label">延迟 (ms)</span>
-                <input type="number" id="propDelay" value="${selectedLink.delay}" class="prop-input" min="1" max="500">
+                <input type="number" id="propDelay" value="${selectedLink.delay}" class="prop-input" min="1" max="500" ${isEnabled ? '' : 'disabled'}>
             </div>
             <div class="prop-row">
                 <span class="prop-label">当前负载</span>
-                <span class="prop-value">${loadRatio}%</span>
+                <span class="prop-value">${isEnabled ? loadRatio + '%' : '-'}</span>
+            </div>
+            <div class="prop-row switch-row">
+                <span class="prop-label">链路状态</span>
+                <div class="switch ${isEnabled ? 'on' : 'off'}" id="linkSwitch">
+                    <div class="switch-handle"></div>
+                </div>
+            </div>
+            <div class="prop-row">
+                <span class="prop-value" style="color: ${isEnabled ? '#52c41a' : '#ff4d4f'}; font-weight: 500;">
+                    ${isEnabled ? '正常运行' : '已禁用'}
+                </span>
             </div>
         `;
         
@@ -1313,6 +1547,10 @@ function updatePropertyPanel() {
                 selectedLink.delay = val;
                 recalculateRoutes();
             }
+        });
+        
+        document.getElementById('linkSwitch').addEventListener('click', () => {
+            toggleLinkEnabled(selectedLink.id);
         });
     } else {
         panel.innerHTML = '<p class="hint">请选择设备或链路查看属性</p>';
@@ -1413,11 +1651,14 @@ function updateTrafficList() {
         const src = devices.find(d => d.id === flow.srcId);
         const dst = devices.find(d => d.id === flow.dstId);
         const progress = Math.min(100, (flow.sentPackets / flow.totalPackets) * 100);
+        const statusText = flow.paused ? '等待恢复' : `${(flow.rate/1000000).toFixed(1)}Mbps`;
+        const statusColor = flow.paused ? '#faad14' : '#999';
+        const itemClass = flow.paused ? 'traffic-item paused' : 'traffic-item';
         
-        html += `<div class="traffic-item">
+        html += `<div class="${itemClass}">
             <div>
                 <div>${src?.name || '-'} → ${dst?.name || '-'}</div>
-                <div style="font-size:11px;color:#999;">${(flow.rate/1000000).toFixed(1)}Mbps</div>
+                <div style="font-size:11px;color:${statusColor};">${statusText}</div>
             </div>
             <div style="flex:1;margin-left:10px;">
                 <div class="progress">
@@ -1446,6 +1687,18 @@ function updateTrafficProgress() {
     });
 }
 
+function updateFaultStats() {
+    const disabledCountEl = document.getElementById('disabledLinkCount');
+    const totalFaultEl = document.getElementById('totalFaultCount');
+    const pathSwitchEl = document.getElementById('pathSwitchCount');
+    const pausedFlowEl = document.getElementById('pausedFlowCount');
+    
+    if (disabledCountEl) disabledCountEl.textContent = faultStats.disabledLinkCount;
+    if (totalFaultEl) totalFaultEl.textContent = faultStats.totalFaultCount;
+    if (pathSwitchEl) pathSwitchEl.textContent = faultStats.pathSwitchCount;
+    if (pausedFlowEl) pausedFlowEl.textContent = faultStats.pausedFlowCount;
+}
+
 function exportTopology() {
     const data = {
         version: '1.0',
@@ -1461,7 +1714,8 @@ function exportTopology() {
             from: l.from,
             to: l.to,
             bandwidth: l.bandwidth,
-            delay: l.delay
+            delay: l.delay,
+            enabled: l.enabled
         })),
         manualRoutes: manualRoutes
     };
@@ -1495,7 +1749,10 @@ function importTopology(e) {
             }
             
             devices = data.devices.map(d => ({ ...d }));
-            links = data.links.map(l => ({ ...l }));
+            links = data.links.map(l => ({ 
+                ...l, 
+                enabled: l.enabled !== undefined ? l.enabled : true 
+            }));
             manualRoutes = data.manualRoutes || [];
             
             deviceIdCounter = Math.max(...devices.map(d => d.id), 0) + 1;
@@ -1505,6 +1762,13 @@ function importTopology(e) {
             packets = [];
             congestionStates.clear();
             
+            faultStats = {
+                disabledLinkCount: links.filter(l => !l.enabled).length,
+                totalFaultCount: 0,
+                pathSwitchCount: 0,
+                pausedFlowCount: 0
+            };
+            
             selectedDevice = null;
             selectedLink = null;
             
@@ -1513,6 +1777,7 @@ function importTopology(e) {
             updatePropertyPanel();
             recalculateRoutes();
             updateTrafficList();
+            updateFaultStats();
             
             addLog('拓扑导入成功', 'success');
             

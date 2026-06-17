@@ -106,6 +106,33 @@
                 <button id="addManualRoute" class="btn btn-small">添加手动路由</button>
                 <div id="manualRouteList" class="manual-route-list"></div>
             </div>
+
+            <h3>故障统计</h3>
+            <div class="fault-stats-panel">
+                <div class="fault-stat-row">
+                    <span class="fault-stat-label">当前禁用链路</span>
+                    <span class="fault-stat-value" id="disabledLinkCount">0</span>
+                </div>
+                <div class="fault-stat-row">
+                    <span class="fault-stat-label">历史故障次数</span>
+                    <span class="fault-stat-value" id="totalFaultCount">0</span>
+                </div>
+                <div class="fault-stat-row">
+                    <span class="fault-stat-label">路径切换次数</span>
+                    <span class="fault-stat-value" id="pathSwitchCount">0</span>
+                </div>
+                <div class="fault-stat-row">
+                    <span class="fault-stat-label">流量暂停次数</span>
+                    <span class="fault-stat-value" id="pausedFlowCount">0</span>
+                </div>
+                <div class="fault-actions">
+                    <button id="batchFaultBtn" class="btn btn-small">批量模式</button>
+                    <button id="restoreAllBtn" class="btn btn-small btn-success">全部恢复</button>
+                </div>
+                <div id="batchFaultHint" class="batch-hint" style="display:none;">
+                    批量模式：点击链路切换状态，完成后点击"应用"
+                </div>
+            </div>
         </div>
     </div>
 
