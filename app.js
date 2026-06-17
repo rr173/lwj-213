@@ -608,6 +608,8 @@ function updateLinkCongestion() {
     trafficFlows.forEach(flow => {
         if (!flow.path || flow.completed) return;
         
+        flow.actualRate = flow.rate;
+        
         flow.path.segments.forEach(seg => {
             const loadInfo = linkLoads.get(seg.link.id);
             if (loadInfo) {
@@ -624,7 +626,10 @@ function updateLinkCongestion() {
         if (loadRatio > 1) {
             const ratio = (link.bandwidth * 1000000) / loadInfo.totalRequest;
             loadInfo.flows.forEach(flow => {
-                flow.actualRate = flow.rate * ratio;
+                const limitedRate = flow.rate * ratio;
+                if (limitedRate < flow.actualRate) {
+                    flow.actualRate = limitedRate;
+                }
             });
             
             if (!congestionStates.has(link.id)) {
@@ -642,9 +647,6 @@ function updateLinkCongestion() {
             if (congestionStates.has(link.id)) {
                 congestionStates.delete(link.id);
             }
-            loadInfo.flows.forEach(flow => {
-                flow.actualRate = flow.rate;
-            });
         }
     });
 }
