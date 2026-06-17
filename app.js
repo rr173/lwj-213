@@ -607,6 +607,24 @@ function getLinkLoad(linkId) {
     return totalRate / (link.bandwidth * 1000000);
 }
 
+function getLinkRequestedLoad(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (!link || !link.enabled) return 0;
+    
+    let totalRate = 0;
+    trafficFlows.forEach(flow => {
+        if (flow.completed || flow.paused) return;
+        if (flow.path && flow.path.segments && flow.path.segments.some(seg => 
+            (seg.from === link.from && seg.to === link.to) ||
+            (seg.from === link.to && seg.to === link.from)
+        )) {
+            totalRate += flow.rate;
+        }
+    });
+    
+    return totalRate / (link.bandwidth * 1000000);
+}
+
 function recalculateRoutes() {
     updateRoutingTables();
     updateRoutingTableDisplay();
@@ -1874,6 +1892,7 @@ function validateTopology(data) {
 let scenarios = [];
 let selectedScenarioId = null;
 let currentRunningScenario = null;
+let scenarioIsRunning = false;
 let scenarioStartTime = 0;
 let scenarioElapsed = 0;
 let scenarioTimer = null;
@@ -1884,6 +1903,7 @@ let scenarioLinkSamples = new Map();
 let scenarioReportData = null;
 let scenarioIdCounter = 1;
 let reportCollapsed = false;
+let scenarioEventIdSet = new Set();
 
 const MAX_SCENARIOS = 5;
 
@@ -2074,7 +2094,7 @@ function renderEventList() {
 }
 
 function startScenario() {
-    if (currentRunningScenario) {
+    if (currentRunningScenario || scenarioIsRunning) {
         alert('已有场景正在运行');
         return;
     }
@@ -2087,16 +2107,19 @@ function startScenario() {
     }
 
     currentRunningScenario = scenario;
+    scenarioIsRunning = true;
     scenarioStartTime = Date.now();
     scenarioElapsed = 0;
     scenarioTriggeredEvents = 0;
     scenarioFlowResults = [];
     scenarioLinkSamples = new Map();
     scenarioReportData = null;
+    scenarioEventIdSet = new Set();
 
     scenario.events.forEach(e => {
         e.triggered = false;
         e.flowId = null;
+        scenarioEventIdSet.add(e.id);
     });
 
     document.getElementById('runScenarioBtn').style.display = 'none';
@@ -2155,7 +2178,7 @@ function scenarioSample() {
         if (!scenarioLinkSamples.has(link.id)) {
             scenarioLinkSamples.set(link.id, []);
         }
-        const load = getLinkLoad(link.id);
+        const load = getLinkRequestedLoad(link.id);
         scenarioLinkSamples.get(link.id).push({
             time: Math.round(sampleTime * 10) / 10,
             load: load
@@ -2185,19 +2208,26 @@ function checkScenarioCompleted() {
 
 function finishScenario() {
     if (!currentRunningScenario) return;
+    
+    scenarioIsRunning = false;
     clearInterval(scenarioTimer);
     clearInterval(scenarioSamplingTimer);
     scenarioTimer = null;
     scenarioSamplingTimer = null;
+    
+    clearFlowScenarioMarkers();
 
     addLog(`压测场景完成: ${currentRunningScenario.name}`, 'success');
     generateReport();
     resetScenarioUI();
     currentRunningScenario = null;
+    scenarioEventIdSet.clear();
 }
 
 function stopScenario() {
     if (!currentRunningScenario) return;
+    
+    scenarioIsRunning = false;
     clearInterval(scenarioTimer);
     clearInterval(scenarioSamplingTimer);
     scenarioTimer = null;
@@ -2210,11 +2240,22 @@ function stopScenario() {
     packets = packets.filter(p => !activeFlowIds.has(p.flowId));
     updateTrafficList();
     updateLinkCongestion();
+    
+    clearFlowScenarioMarkers();
 
     addLog(`压测场景中止: ${currentRunningScenario.name}`, 'warning');
     generateReport(true);
     resetScenarioUI();
     currentRunningScenario = null;
+    scenarioEventIdSet.clear();
+}
+
+function clearFlowScenarioMarkers() {
+    trafficFlows.forEach(flow => {
+        if (flow.scenarioEventId) {
+            delete flow.scenarioEventId;
+        }
+    });
 }
 
 function resetScenarioUI() {
@@ -2235,11 +2276,14 @@ function updateScenarioProgress() {
 }
 
 function recordFlowCompletion(flow) {
+    if (!scenarioIsRunning) return;
     if (!currentRunningScenario) return;
     if (!flow.scenarioEventId) return;
+    if (!scenarioEventIdSet.has(flow.scenarioEventId)) return;
+    if (scenarioFlowResults.some(r => r.eventId === flow.scenarioEventId)) return;
+
     const event = currentRunningScenario.events.find(e => e.id === flow.scenarioEventId);
     if (!event) return;
-    if (scenarioFlowResults.some(r => r.eventId === event.id)) return;
 
     const duration = flow.endTime && flow.startTime ? (flow.endTime - flow.startTime) / 1000 : 0;
     const lossRate = flow.totalPackets > 0 ? (flow.lostPackets / flow.totalPackets) * 100 : 0;
@@ -2379,9 +2423,9 @@ function renderReport() {
     } else {
         let html = '';
         scenarioReportData.linkStats.forEach(ls => {
-            const peakPercent = Math.min(100, ls.peakLoad * 100);
+            const peakPercent = Math.min(200, ls.peakLoad * 100);
             let barColor = '#52c41a';
-            if (ls.peakLoad > 0.85) barColor = '#ff4d4f';
+            if (ls.peakLoad > 1.0) barColor = '#ff4d4f';
             else if (ls.peakLoad > 0.6) barColor = '#faad14';
             
             html += `<div class="report-link-item" style="display:block;">
