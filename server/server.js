@@ -17,7 +17,9 @@ const {
   saveAuditReport,
   listAuditReports,
   getAuditReport,
-  compareAuditReports
+  compareAuditReports,
+  savePartitionChange,
+  listPartitionChanges
 } = require('./database');
 
 const app = express();
@@ -310,6 +312,40 @@ app.get('/api/audits/compare/:id1/:id2', async (req, res) => {
   } catch (err) {
     console.error('对比审计报告失败:', err);
     res.status(500).json({ error: '对比失败' });
+  }
+});
+
+app.post('/api/partitions/changes', async (req, res) => {
+  try {
+    const changeData = req.body;
+
+    if (changeData.oldCount === undefined || changeData.newCount === undefined) {
+      return res.status(400).json({ error: '缺少必要字段: oldCount, newCount' });
+    }
+
+    const result = await savePartitionChange(changeData);
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存分区变更失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/partitions/changes', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const changes = await listPartitionChanges(limit);
+    res.json({
+      success: true,
+      data: changes
+    });
+  } catch (err) {
+    console.error('获取分区变更历史失败:', err);
+    res.status(500).json({ error: '获取失败' });
   }
 });
 

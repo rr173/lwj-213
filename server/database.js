@@ -72,6 +72,19 @@ function initDatabase() {
       `);
 
       db.run(`
+        CREATE TABLE IF NOT EXISTS partition_changes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          old_count INTEGER NOT NULL,
+          new_count INTEGER NOT NULL,
+          trigger_link_id INTEGER,
+          trigger_action TEXT,
+          trigger_link_name TEXT,
+          topology_snapshot TEXT,
+          timestamp INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
         CREATE INDEX IF NOT EXISTS idx_topology_versions_created 
         ON topology_versions(created_at DESC)
       `);
@@ -84,6 +97,11 @@ function initDatabase() {
       db.run(`
         CREATE INDEX IF NOT EXISTS idx_audit_reports_timestamp 
         ON audit_reports(timestamp DESC)
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_partition_changes_timestamp 
+        ON partition_changes(timestamp DESC)
       `, (err) => {
         if (err) reject(err);
         else resolve();
@@ -588,6 +606,58 @@ async function compareAuditReports(reportId1, reportId2) {
   };
 }
 
+function savePartitionChange(changeData) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`
+      INSERT INTO partition_changes (
+        old_count, new_count, trigger_link_id, trigger_action,
+        trigger_link_name, topology_snapshot, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(
+      changeData.oldCount,
+      changeData.newCount,
+      changeData.triggerLinkId || null,
+      changeData.triggerAction || null,
+      changeData.triggerLinkName || null,
+      changeData.topologySnapshot ? JSON.stringify(changeData.topologySnapshot) : null,
+      changeData.timestamp || Date.now(),
+      function(err) {
+        if (err) return reject(err);
+        resolve({
+          id: this.lastID,
+          oldCount: changeData.oldCount,
+          newCount: changeData.newCount,
+          timestamp: changeData.timestamp || Date.now()
+        });
+      }
+    );
+  });
+}
+
+function listPartitionChanges(limit = 50) {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT * FROM partition_changes 
+      ORDER BY timestamp DESC 
+      LIMIT ?
+    `, [limit], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        oldCount: row.old_count,
+        newCount: row.new_count,
+        triggerLinkId: row.trigger_link_id,
+        triggerAction: row.trigger_action,
+        triggerLinkName: row.trigger_link_name,
+        topologySnapshot: row.topology_snapshot ? JSON.parse(row.topology_snapshot) : null,
+        timestamp: row.timestamp
+      })));
+    });
+  });
+}
+
 module.exports = {
   initDatabase,
   saveTopology,
@@ -603,5 +673,7 @@ module.exports = {
   saveAuditReport,
   listAuditReports,
   getAuditReport,
-  compareAuditReports
+  compareAuditReports,
+  savePartitionChange,
+  listPartitionChanges
 };

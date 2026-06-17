@@ -45,6 +45,126 @@ const DEVICE_RADIUS = 20;
 const MAX_DEVICES = 50;
 const MAX_TRAFFIC_FLOWS = 10;
 
+let partitions = [];
+let partitionColorMap = new Map();
+let partitionChangeHistory = [];
+const MAX_PARTITION_HISTORY = 10;
+
+const PARTITION_COLORS = [
+    '#1890ff',
+    '#52c41a',
+    '#fa8c16',
+    '#722ed1',
+    '#eb2f96',
+    '#13c2c2',
+    '#fa541c',
+    '#2f54eb',
+    '#a0d911',
+    '#faad14'
+];
+
+function calculatePartitions() {
+    const visited = new Set();
+    const newPartitions = [];
+    const newColorMap = new Map();
+    
+    devices.forEach(device => {
+        if (visited.has(device.id)) return;
+        
+        const partition = [];
+        const queue = [device.id];
+        visited.add(device.id);
+        
+        while (queue.length > 0) {
+            const currentId = queue.shift();
+            partition.push(currentId);
+            
+            const neighbors = getNeighbors(currentId);
+            neighbors.forEach(({ nodeId }) => {
+                if (!visited.has(nodeId)) {
+                    visited.add(nodeId);
+                    queue.push(nodeId);
+                }
+            });
+        }
+        
+        if (partition.length > 0) {
+            const partitionIndex = newPartitions.length;
+            newPartitions.push({
+                id: partitionIndex + 1,
+                deviceIds: partition,
+                color: PARTITION_COLORS[partitionIndex % PARTITION_COLORS.length]
+            });
+            partition.forEach(deviceId => {
+                newColorMap.set(deviceId, partitionIndex);
+            });
+        }
+    });
+    
+    const oldCount = partitions.length;
+    const newCount = newPartitions.length;
+    
+    partitions = newPartitions;
+    partitionColorMap = newColorMap;
+    
+    if (oldCount !== newCount) {
+        return { changed: true, oldCount, newCount };
+    }
+    
+    return { changed: false, oldCount, newCount };
+}
+
+function getDevicePartitionIndex(deviceId) {
+    return partitionColorMap.get(deviceId);
+}
+
+function areDevicesInSamePartition(deviceId1, deviceId2) {
+    const p1 = getDevicePartitionIndex(deviceId1);
+    const p2 = getDevicePartitionIndex(deviceId2);
+    return p1 !== undefined && p2 !== undefined && p1 === p2;
+}
+
+function getPartitionColor(deviceId) {
+    const idx = getDevicePartitionIndex(deviceId);
+    if (idx === undefined) return null;
+    return partitions[idx]?.color || null;
+}
+
+function recordPartitionChange(oldCount, newCount, triggerLinkId, triggerAction) {
+    const event = {
+        id: Date.now(),
+        timestamp: Date.now(),
+        oldCount: oldCount,
+        newCount: newCount,
+        triggerLinkId: triggerLinkId || null,
+        triggerAction: triggerAction || null,
+        triggerLinkName: triggerLinkId ? getLinkDisplayName(triggerLinkId) : null
+    };
+    
+    partitionChangeHistory.unshift(event);
+    if (partitionChangeHistory.length > MAX_PARTITION_HISTORY) {
+        partitionChangeHistory = partitionChangeHistory.slice(0, MAX_PARTITION_HISTORY);
+    }
+    
+    savePartitionChangeToBackend(event);
+}
+
+function getLinkDisplayName(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (!link) return '未知链路';
+    const from = devices.find(d => d.id === link.from);
+    const to = devices.find(d => d.id === link.to);
+    return `${from?.name || '?'} - ${to?.name || '?'}`;
+}
+
+function triggerPartitionRecalculation(triggerLinkId, triggerAction) {
+    const result = calculatePartitions();
+    if (result.changed) {
+        recordPartitionChange(result.oldCount, result.newCount, triggerLinkId, triggerAction);
+    }
+    updatePartitionPanel();
+}
+
 function init() {
     resizeCanvas();
     window.addEventListener('resize', resizeCanvas);
@@ -54,10 +174,16 @@ function init() {
     setupUIEvents();
     setupModalEvents();
     setupContextMenu();
+    setupScenarioEvents();
+    setupBackendEvents();
+    setupConfigAuditEvents();
     
     updateDeviceCount();
     updateDeviceSelects();
     updateFaultStats();
+    calculatePartitions();
+    updatePartitionPanel();
+    loadPartitionHistory();
     
     requestAnimationFrame(animate);
 }
@@ -279,6 +405,7 @@ function addDevice(type, x, y) {
     updateDeviceCount();
     updateDeviceSelects();
     recalculateRoutes();
+    triggerPartitionRecalculation(null, 'add_device');
     
     return device;
 }
@@ -311,6 +438,7 @@ function deleteDevice(deviceId) {
     rerouteAffectedFlows();
     updateTrafficList();
     updateFaultStats();
+    triggerPartitionRecalculation(null, 'delete_device');
 }
 
 function getDeviceAt(x, y) {
@@ -389,6 +517,7 @@ function addLink(fromId, toId, bandwidth, delay) {
     
     links.push(link);
     recalculateRoutes();
+    triggerPartitionRecalculation(link.id, 'add_link');
     
     return link;
 }
@@ -408,6 +537,7 @@ function deleteLink(linkId) {
     
     recalculateRoutes();
     updateFaultStats();
+    triggerPartitionRecalculation(linkId, 'delete_link');
 }
 
 function toggleLinkEnabled(linkId) {
@@ -430,14 +560,16 @@ function toggleLinkEnabled(linkId) {
         return;
     }
     
-    handleLinkStateChange();
+    const action = link.enabled ? 'enable_link' : 'disable_link';
+    handleLinkStateChange(linkId, action);
 }
 
-function handleLinkStateChange() {
+function handleLinkStateChange(triggerLinkId = null, triggerAction = null) {
     recalculateRoutes();
     rerouteAffectedFlows();
     updatePropertyPanel();
     updateFaultStats();
+    triggerPartitionRecalculation(triggerLinkId, triggerAction);
 }
 
 function getPathNodeNames(path) {
@@ -796,6 +928,11 @@ function injectTraffic(srcId, dstId, dataSizeKB, rateMbps) {
         return false;
     }
     
+    if (!areDevicesInSamePartition(srcId, dstId)) {
+        addLog(`源和目的不在同一分区，无法通信: ${getDeviceName(srcId)} → ${getDeviceName(dstId)}`, 'error');
+        return false;
+    }
+    
     const pathResult = getPath(srcId, dstId);
     if (!pathResult) {
         addLog(`从 ${getDeviceName(srcId)} 到 ${getDeviceName(dstId)} 不可达`, 'error');
@@ -1126,13 +1263,22 @@ function drawGrid() {
 
 function drawDevice(device) {
     const isSelected = selectedDevice && selectedDevice.id === device.id;
+    const partitionColor = getPartitionColor(device.id);
     
     ctx.save();
     ctx.translate(device.x, device.y);
     
+    if (partitionColor && partitions.length > 1) {
+        ctx.beginPath();
+        ctx.arc(0, 0, DEVICE_RADIUS + 6, 0, Math.PI * 2);
+        ctx.strokeStyle = partitionColor;
+        ctx.lineWidth = 3;
+        ctx.stroke();
+    }
+    
     if (isSelected) {
         ctx.beginPath();
-        ctx.arc(0, 0, DEVICE_RADIUS + 5, 0, Math.PI * 2);
+        ctx.arc(0, 0, DEVICE_RADIUS + 3, 0, Math.PI * 2);
         ctx.strokeStyle = '#1890ff';
         ctx.lineWidth = 2;
         ctx.stroke();
@@ -1730,6 +1876,91 @@ function updateFaultStats() {
     if (pausedFlowEl) pausedFlowEl.textContent = faultStats.pausedFlowCount;
 }
 
+function updatePartitionPanel() {
+    const statusEl = document.getElementById('partitionStatus');
+    const statusTextEl = document.getElementById('partitionStatusText');
+    const listEl = document.getElementById('partitionList');
+    const historyEl = document.getElementById('partitionHistoryList');
+    
+    if (!statusEl || !listEl) return;
+    
+    const partitionCount = partitions.length;
+    const isSplit = partitionCount > 1;
+    
+    statusEl.className = 'partition-status' + (isSplit ? ' split' : '');
+    statusTextEl.textContent = isSplit ? `网络分裂为 ${partitionCount} 个分区` : '网络全连通';
+    
+    if (partitionCount === 0) {
+        listEl.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:8px 0;">暂无设备</p>';
+    } else if (partitionCount === 1) {
+        listEl.innerHTML = '';
+    } else {
+        let html = '';
+        partitions.forEach(partition => {
+            const deviceNames = partition.deviceIds.map(id => getDeviceName(id)).join(', ');
+            html += `
+                <div class="partition-item" style="border-left-color: ${partition.color};">
+                    <div class="partition-item-header">
+                        <span class="partition-item-name">
+                            <span class="partition-color-dot" style="background: ${partition.color};"></span>
+                            分区 ${partition.id}
+                        </span>
+                        <span class="partition-item-count">${partition.deviceIds.length} 台设备</span>
+                    </div>
+                    <div class="partition-item-devices">${escapeHtml(deviceNames)}</div>
+                </div>
+            `;
+        });
+        listEl.innerHTML = html;
+    }
+    
+    if (historyEl) {
+        if (partitionChangeHistory.length === 0) {
+            historyEl.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:8px 0;">暂无变更记录</p>';
+        } else {
+            let html = '';
+            partitionChangeHistory.forEach(event => {
+                const time = new Date(event.timestamp).toLocaleTimeString();
+                const isIncrease = event.newCount > event.oldCount;
+                const itemClass = isIncrease ? 'split-increase' : 'split-decrease';
+                const arrow = isIncrease ? '↑' : '↓';
+                
+                const actionLabels = {
+                    'enable_link': '链路启用',
+                    'disable_link': '链路禁用',
+                    'add_link': '添加链路',
+                    'delete_link': '删除链路',
+                    'add_device': '添加设备',
+                    'delete_device': '删除设备',
+                    'load_topology': '加载拓扑',
+                    'import_topology': '导入拓扑',
+                    'config_generated': '配置生成'
+                };
+                
+                const actionLabel = actionLabels[event.triggerAction] || event.triggerAction || '未知';
+                let triggerText = '';
+                
+                if (event.triggerLinkName) {
+                    triggerText = `触发: ${escapeHtml(event.triggerLinkName)} (${actionLabel})`;
+                } else if (event.triggerAction) {
+                    triggerText = `触发: ${actionLabel}`;
+                }
+                
+                html += `
+                    <div class="partition-history-item ${itemClass}">
+                        <div class="partition-history-time">${time}</div>
+                        <div class="partition-history-detail">
+                            分区数: ${event.oldCount} → ${event.newCount} ${arrow}
+                        </div>
+                        ${triggerText ? `<div class="partition-history-trigger">${triggerText}</div>` : ''}
+                    </div>
+                `;
+            });
+            historyEl.innerHTML = html;
+        }
+    }
+}
+
 function exportTopology() {
     const data = {
         version: '1.0',
@@ -1809,6 +2040,7 @@ function importTopology(e) {
             recalculateRoutes();
             updateTrafficList();
             updateFaultStats();
+            triggerPartitionRecalculation(null, 'import_topology');
             
             addLog('拓扑导入成功', 'success');
             
@@ -2143,14 +2375,9 @@ function scenarioTick() {
         if (!event.triggered && scenarioElapsed >= event.time) {
             event.triggered = true;
             scenarioTriggeredEvents++;
-            const success = injectTraffic(event.srcId, event.dstId, event.dataSize, event.rate);
-            if (success) {
-                const flow = trafficFlows[trafficFlows.length - 1];
-                if (flow) {
-                    event.flowId = flow.id;
-                    flow.scenarioEventId = event.id;
-                }
-            } else {
+            
+            if (!areDevicesInSamePartition(event.srcId, event.dstId)) {
+                addLog(`压测事件失败: 源和目的不在同一分区 - ${getDeviceName(event.srcId)} → ${getDeviceName(event.dstId)}`, 'error');
                 scenarioFlowResults.push({
                     eventId: event.id,
                     srcId: event.srcId,
@@ -2161,8 +2388,30 @@ function scenarioTick() {
                     lossRate: 100,
                     path: null,
                     failed: true,
-                    failedReason: 'unreachable'
+                    failedReason: 'cross_partition'
                 });
+            } else {
+                const success = injectTraffic(event.srcId, event.dstId, event.dataSize, event.rate);
+                if (success) {
+                    const flow = trafficFlows[trafficFlows.length - 1];
+                    if (flow) {
+                        event.flowId = flow.id;
+                        flow.scenarioEventId = event.id;
+                    }
+                } else {
+                    scenarioFlowResults.push({
+                        eventId: event.id,
+                        srcId: event.srcId,
+                        dstId: event.dstId,
+                        dataSize: event.dataSize,
+                        rate: event.rate,
+                        duration: 0,
+                        lossRate: 100,
+                        path: null,
+                        failed: true,
+                        failedReason: 'unreachable'
+                    });
+                }
             }
         }
     });
@@ -2314,6 +2563,7 @@ function generateReport(aborted = false) {
     const totalFlows = currentRunningScenario.events.length;
 
     const unreachableFlows = scenarioFlowResults.filter(r => r.failed && r.failedReason === 'unreachable').length;
+    const crossPartitionFlows = scenarioFlowResults.filter(r => r.failed && r.failedReason === 'cross_partition').length;
     const completedFlows = scenarioFlowResults.filter(r => !r.failed).length;
     const totalLossRate = scenarioFlowResults.length > 0 
         ? (scenarioFlowResults.reduce((sum, r) => sum + r.lossRate, 0) / scenarioFlowResults.length)
@@ -2390,6 +2640,7 @@ function generateReport(aborted = false) {
         totalFlows: totalFlows,
         completedFlows: completedFlows,
         unreachableFlows: unreachableFlows,
+        crossPartitionFlows: crossPartitionFlows,
         avgLossRate: totalLossRate,
         linkStats: linkStats,
         flowDetails: flowDetails,
@@ -2425,6 +2676,10 @@ function renderReport() {
         <div class="report-stat-row">
             <span class="report-stat-label">不可达失败</span>
             <span class="report-stat-value">${scenarioReportData.unreachableFlows}</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">跨分区失败</span>
+            <span class="report-stat-value">${scenarioReportData.crossPartitionFlows || 0}</span>
         </div>
         <div class="report-stat-row" style="grid-column: 1 / -1;">
             <span class="report-stat-label">全局平均丢包率</span>
@@ -2467,9 +2722,16 @@ function renderReport() {
         let html = '';
         scenarioReportData.flowDetails.forEach(fd => {
             const statusClass = fd.failed ? 'failed' : 'success';
-            const statusText = fd.failed 
-                ? (fd.failedReason === 'unreachable' ? '不可达' : '已中止')
-                : '完成';
+            let statusText = '完成';
+            if (fd.failed) {
+                if (fd.failedReason === 'unreachable') {
+                    statusText = '不可达';
+                } else if (fd.failedReason === 'cross_partition') {
+                    statusText = '跨分区';
+                } else {
+                    statusText = '已中止';
+                }
+            }
             html += `<div class="report-flow-item">
                 <div class="report-flow-item-header">
                     <span class="report-flow-name">T+${fd.time.toFixed(1)}s ${escapeHtml(fd.src)} → ${escapeHtml(fd.dst)}</span>
@@ -2684,6 +2946,7 @@ function applyTopologyData(data) {
     recalculateRoutes();
     updateTrafficList();
     updateFaultStats();
+    triggerPartitionRecalculation(null, 'load_topology');
 }
 
 async function saveReportToBackend(reportData) {
@@ -2711,6 +2974,36 @@ async function saveReportToBackend(reportData) {
         addLog('保存报告到后端失败: ' + errorMsg, 'error');
         alert('警告：报告保存到后端失败！\n错误信息：' + errorMsg + '\n报告已在本地生成，但未持久化到服务器，刷新页面后将丢失。');
         return null;
+    }
+}
+
+async function savePartitionChangeToBackend(event) {
+    const topologySnapshot = {
+        devices: devices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
+        links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled })),
+        manualRoutes: manualRoutes
+    };
+
+    const fullEvent = {
+        ...event,
+        topologySnapshot
+    };
+
+    const result = await apiRequest('/partitions/changes', {
+        method: 'POST',
+        body: JSON.stringify(fullEvent)
+    });
+
+    if (!result.success) {
+        console.warn('保存分区变更到后端失败:', result.error);
+    }
+}
+
+async function loadPartitionHistory() {
+    const result = await apiRequest('/partitions/changes?limit=10');
+    if (result.success && result.data) {
+        partitionChangeHistory = result.data.slice(0, MAX_PARTITION_HISTORY);
+        updatePartitionPanel();
     }
 }
 
@@ -3182,6 +3475,7 @@ function generateTopologyFromConfig(configData, layoutMode) {
     updateDeviceSelects();
     recalculateRoutes();
     updateFaultStats();
+    triggerPartitionRecalculation(null, 'config_generated');
 
     return { devices: newDevices, links: newLinks };
 }

@@ -550,6 +550,150 @@ body {
     color: #1890ff;
 }
 
+.partition-monitor-panel {
+    font-size: 13px;
+}
+
+.partition-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    background: #f6ffed;
+    border: 1px solid #b7eb8f;
+    border-radius: 6px;
+    margin-bottom: 10px;
+}
+
+.partition-status.split {
+    background: #fff1f0;
+    border-color: #ffa39e;
+}
+
+.partition-status-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #52c41a;
+    flex-shrink: 0;
+}
+
+.partition-status.split .partition-status-indicator {
+    background: #ff4d4f;
+}
+
+.partition-status-text {
+    font-weight: 500;
+    color: #389e0d;
+    flex: 1;
+}
+
+.partition-status.split .partition-status-text {
+    color: #cf1322;
+}
+
+.partition-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.partition-item {
+    padding: 8px 10px;
+    background: #fafafa;
+    border: 1px solid #e8e8e8;
+    border-radius: 4px;
+    border-left: 4px solid #ccc;
+}
+
+.partition-item-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+    font-size: 12px;
+}
+
+.partition-item-name {
+    font-weight: 500;
+    color: #333;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.partition-color-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.partition-item-count {
+    color: #999;
+    font-size: 11px;
+}
+
+.partition-item-devices {
+    font-size: 11px;
+    color: #666;
+    line-height: 1.4;
+}
+
+.partition-history-section {
+    border-top: 1px solid #eee;
+    padding-top: 8px;
+}
+
+.partition-history-title {
+    font-size: 12px;
+    color: #666;
+    margin-bottom: 6px;
+    font-weight: 500;
+}
+
+.partition-history-list {
+    max-height: 180px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.partition-history-item {
+    padding: 6px 8px;
+    background: #f5f7fa;
+    border-radius: 4px;
+    font-size: 11px;
+    border-left: 3px solid #1890ff;
+}
+
+.partition-history-item.split-increase {
+    border-left-color: #ff4d4f;
+}
+
+.partition-history-item.split-decrease {
+    border-left-color: #52c41a;
+}
+
+.partition-history-time {
+    color: #999;
+    font-size: 10px;
+    margin-bottom: 2px;
+}
+
+.partition-history-detail {
+    color: #333;
+    line-height: 1.3;
+}
+
+.partition-history-trigger {
+    color: #666;
+    font-size: 10px;
+    margin-top: 2px;
+}
+
 .scenario-panel {
     font-size: 13px;
 }
