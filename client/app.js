@@ -2288,6 +2288,10 @@ function recordFlowCompletion(flow) {
     const duration = flow.endTime && flow.startTime ? (flow.endTime - flow.startTime) / 1000 : 0;
     const lossRate = flow.totalPackets > 0 ? (flow.lostPackets / flow.totalPackets) * 100 : 0;
 
+    const linkIds = flow.path && flow.path.segments 
+        ? flow.path.segments.map(seg => seg.link.id) 
+        : [];
+    
     scenarioFlowResults.push({
         eventId: event.id,
         srcId: event.srcId,
@@ -2296,6 +2300,7 @@ function recordFlowCompletion(flow) {
         rate: event.rate,
         duration: duration,
         lossRate: lossRate,
+        linkIds: linkIds,
         path: flow.path ? getPathNodeNames(flow.path) : null,
         failed: false,
         failedReason: null
@@ -2323,6 +2328,14 @@ function generateReport(aborted = false) {
         const avgLoad = loads.reduce((a, b) => a + b, 0) / loads.length;
         const congestedSamples = loads.filter(l => l > 1.0).length;
         const congestedDuration = congestedSamples * 0.1;
+
+        const flowsOnLink = scenarioFlowResults.filter(r => 
+            !r.failed && r.linkIds && r.linkIds.includes(link.id)
+        );
+        const linkLossRate = flowsOnLink.length > 0
+            ? flowsOnLink.reduce((sum, r) => sum + r.lossRate, 0) / flowsOnLink.length
+            : 0;
+
         linkStats.push({
             linkId: link.id,
             linkName: `${getDeviceName(link.from)} - ${getDeviceName(link.to)}`,
@@ -2330,6 +2343,8 @@ function generateReport(aborted = false) {
             peakLoad: peakLoad,
             avgLoad: avgLoad,
             congestedDuration: congestedDuration,
+            lossRate: linkLossRate,
+            flowCount: flowsOnLink.length,
             samples: samples
         });
     });
@@ -2692,7 +2707,9 @@ async function saveReportToBackend(reportData) {
         addLog(`报告已保存到后端，ID: ${result.data.id}`, 'success');
         return result.data;
     } else {
-        addLog('保存报告到后端失败', 'error');
+        const errorMsg = result.error || '网络连接失败';
+        addLog('保存报告到后端失败: ' + errorMsg, 'error');
+        alert('警告：报告保存到后端失败！\n错误信息：' + errorMsg + '\n报告已在本地生成，但未持久化到服务器，刷新页面后将丢失。');
         return null;
     }
 }

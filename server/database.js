@@ -287,6 +287,14 @@ async function compareReports(reportId1, reportId2) {
 
   const allLinkNames = new Set([...linkMap1.keys(), ...linkMap2.keys()]);
 
+  function getLinkLossRate(ls) {
+    if (!ls) return 0;
+    if (typeof ls.lossRate === 'number') {
+      return ls.lossRate;
+    }
+    return 0;
+  }
+
   const linkComparisons = [];
   allLinkNames.forEach(linkName => {
     const ls1 = linkMap1.get(linkName);
@@ -296,8 +304,8 @@ async function compareReports(reportId1, reportId2) {
     const peakLoad2 = ls2 ? ls2.peakLoad : 0;
     const peakLoadDiff = peakLoad2 - peakLoad1;
 
-    const avgLossRate1 = ls1 ? (ls1.avgLoad > 1 ? (ls1.avgLoad - 1) * 100 : 0) : 0;
-    const avgLossRate2 = ls2 ? (ls2.avgLoad > 1 ? (ls2.avgLoad - 1) * 100 : 0) : 0;
+    const avgLossRate1 = getLinkLossRate(ls1);
+    const avgLossRate2 = getLinkLossRate(ls2);
     
     const lossRateDiff = avgLossRate2 - avgLossRate1;
 

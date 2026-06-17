@@ -4,8 +4,8 @@ WORKDIR /app
 
 RUN apk add --no-cache python3 make g++
 
-COPY server/package.json ./server/
-RUN cd server && npm install --production
+COPY server/package.json server/package-lock.json ./server/
+RUN cd server && npm ci --production
 
 COPY server/ ./server/
 COPY client/ ./client/
