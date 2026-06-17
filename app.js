@@ -666,11 +666,12 @@ function getNeighbors(deviceId) {
     return neighbors;
 }
 
-function getPath(srcId, dstId) {
-    const manualRoute = manualRoutes.find(r => r.src === srcId && r.dst === dstId);
-    
-    if (manualRoute) {
-        return getPathWithNextHop(srcId, dstId, manualRoute.nextHop);
+function getPath(srcId, dstId, ignoreManual = false) {
+    if (!ignoreManual) {
+        const manualRoute = manualRoutes.find(r => r.src === srcId && r.dst === dstId);
+        if (manualRoute) {
+            return getPathWithNextHop(srcId, dstId, manualRoute.nextHop);
+        }
     }
     
     const { dist, prev } = dijkstra(srcId);
@@ -710,13 +711,13 @@ function getPath(srcId, dstId) {
 function getPathWithNextHop(srcId, dstId, nextHopId) {
     const link = findLink(srcId, nextHopId);
     if (!link || !link.enabled) {
-        return getPath(srcId, dstId);
+        return getPath(srcId, dstId, true);
     }
     
     const { dist, prev } = dijkstra(nextHopId);
     
     if (dist[dstId] === Infinity) {
-        return null;
+        return getPath(srcId, dstId, true);
     }
     
     const path = [srcId];
@@ -727,6 +728,11 @@ function getPathWithNextHop(srcId, dstId, nextHopId) {
         current = prev[current];
     }
     path.push(nextHopId, ...restPath);
+    
+    const pathSet = new Set(path);
+    if (pathSet.size !== path.length) {
+        return getPath(srcId, dstId, true);
+    }
     
     const segments = [];
     for (let i = 0; i < path.length - 1; i++) {
