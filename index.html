@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>网络拓扑编辑器与流量路由模拟器</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <div class="left-panel">
+            <h3>设备面板</h3>
+            <div class="device-tools">
+                <div class="device-item" draggable="true" data-type="router">
+                    <div class="device-icon router-icon"></div>
+                    <span>路由器</span>
+                </div>
+                <div class="device-item" draggable="true" data-type="switch">
+                    <div class="device-icon switch-icon"></div>
+                    <span>交换机</span>
+                </div>
+                <div class="device-item" draggable="true" data-type="host">
+                    <div class="device-icon host-icon"></div>
+                    <span>终端主机</span>
+                </div>
+            </div>
+            
+            <h3>流量注入</h3>
+            <div class="traffic-panel">
+                <div class="form-group">
+                    <label>源设备</label>
+                    <select id="srcDevice"></select>
+                </div>
+                <div class="form-group">
+                    <label>目的设备</label>
+                    <select id="dstDevice"></select>
+                </div>
+                <div class="form-group">
+                    <label>数据量 (KB)</label>
+                    <input type="number" id="dataSize" value="1000" min="1">
+                </div>
+                <div class="form-group">
+                    <label>发送速率 (Mbps)</label>
+                    <input type="number" id="sendRate" value="10" min="1">
+                </div>
+                <button id="injectBtn" class="btn btn-primary">注入流量</button>
+                <div class="active-traffic">
+                    <h4>活跃流量 (<span id="trafficCount">0</span>/10)</h4>
+                    <div id="trafficList"></div>
+                </div>
+            </div>
+
+            <h3>导入导出</h3>
+            <div class="io-panel">
+                <button id="exportBtn" class="btn">导出JSON</button>
+                <button id="importBtn" class="btn">导入JSON</button>
+                <input type="file" id="importFile" accept=".json" style="display: none;">
+            </div>
+        </div>
+
+        <div class="canvas-container">
+            <div class="toolbar">
+                <button id="zoomIn" class="btn-small">+</button>
+                <button id="zoomOut" class="btn-small">-</button>
+                <span id="zoomLevel">100%</span>
+                <button id="resetView" class="btn-small">重置视图</button>
+                <span class="divider"></span>
+                <span id="deviceCount">设备: 0/50</span>
+            </div>
+            <canvas id="topologyCanvas"></canvas>
+            <div id="logPanel" class="log-panel">
+                <h4>传输日志</h4>
+                <div id="logContent"></div>
+            </div>
+        </div>
+
+        <div class="right-panel">
+            <h3>属性面板</h3>
+            <div id="propertyPanel" class="property-panel">
+                <p class="hint">请选择设备或链路查看属性</p>
+            </div>
+
+            <h3>路由表</h3>
+            <div class="routing-panel">
+                <div class="form-group">
+                    <label>查看设备</label>
+                    <select id="routingDevice"></select>
+                </div>
+                <div id="routingTable" class="routing-table"></div>
+            </div>
+
+            <h3>手动路由</h3>
+            <div class="manual-route-panel">
+                <div class="form-group">
+                    <label>源</label>
+                    <select id="manualSrc"></select>
+                </div>
+                <div class="form-group">
+                    <label>目的</label>
+                    <select id="manualDst"></select>
+                </div>
+                <div class="form-group">
+                    <label>下一跳</label>
+                    <select id="manualNextHop"></select>
+                </div>
+                <button id="addManualRoute" class="btn btn-small">添加手动路由</button>
+                <div id="manualRouteList" class="manual-route-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="linkConfigModal" class="modal">
+        <div class="modal-content">
+            <h3>链路配置</h3>
+            <div class="form-group">
+                <label>带宽 (Mbps)</label>
+                <input type="number" id="linkBandwidth" value="100" min="1" max="10000">
+            </div>
+            <div class="form-group">
+                <label>延迟 (ms)</label>
+                <input type="number" id="linkDelay" value="10" min="1" max="500">
+            </div>
+            <div class="modal-buttons">
+                <button id="cancelLinkConfig" class="btn">取消</button>
+                <button id="confirmLinkConfig" class="btn btn-primary">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="contextMenu" class="context-menu">
+        <div class="menu-item" data-action="delete">删除</div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
