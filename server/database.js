@@ -49,6 +49,29 @@ function initDatabase() {
       `);
 
       db.run(`
+        CREATE TABLE IF NOT EXISTS device_configs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          config_data TEXT NOT NULL,
+          parsed_devices TEXT NOT NULL,
+          parsed_links TEXT NOT NULL,
+          created_at INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS audit_reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          total_alerts INTEGER NOT NULL,
+          critical_count INTEGER NOT NULL,
+          warning_count INTEGER NOT NULL,
+          info_count INTEGER NOT NULL,
+          alerts TEXT NOT NULL,
+          topology_snapshot TEXT,
+          timestamp INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
         CREATE INDEX IF NOT EXISTS idx_topology_versions_created 
         ON topology_versions(created_at DESC)
       `);
@@ -56,6 +79,11 @@ function initDatabase() {
       db.run(`
         CREATE INDEX IF NOT EXISTS idx_stress_reports_timestamp 
         ON stress_reports(timestamp DESC)
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_audit_reports_timestamp 
+        ON audit_reports(timestamp DESC)
       `, (err) => {
         if (err) reject(err);
         else resolve();
@@ -355,6 +383,211 @@ async function compareReports(reportId1, reportId2) {
   };
 }
 
+function saveDeviceConfig(configData, parsedDevices, parsedLinks) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`
+      INSERT INTO device_configs (config_data, parsed_devices, parsed_links, created_at)
+      VALUES (?, ?, ?, ?)
+    `);
+
+    stmt.run(
+      JSON.stringify(configData),
+      JSON.stringify(parsedDevices),
+      JSON.stringify(parsedLinks),
+      Date.now(),
+      function(err) {
+        if (err) return reject(err);
+        resolve({
+          id: this.lastID,
+          createdAt: Date.now()
+        });
+      }
+    );
+  });
+}
+
+function listDeviceConfigs() {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT id, created_at 
+      FROM device_configs 
+      ORDER BY created_at DESC
+      LIMIT 20
+    `, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        createdAt: row.created_at
+      })));
+    });
+  });
+}
+
+function getDeviceConfig(configId) {
+  return new Promise((resolve, reject) => {
+    db.get(`
+      SELECT * FROM device_configs WHERE id = ?
+    `, [configId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+
+      resolve({
+        id: row.id,
+        configData: JSON.parse(row.config_data),
+        parsedDevices: JSON.parse(row.parsed_devices),
+        parsedLinks: JSON.parse(row.parsed_links),
+        createdAt: row.created_at
+      });
+    });
+  });
+}
+
+function saveAuditReport(auditData) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`
+      INSERT INTO audit_reports (
+        total_alerts, critical_count, warning_count, info_count,
+        alerts, topology_snapshot, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const alerts = auditData.alerts || [];
+    const criticalCount = alerts.filter(a => a.level === 'critical').length;
+    const warningCount = alerts.filter(a => a.level === 'warning').length;
+    const infoCount = alerts.filter(a => a.level === 'info').length;
+
+    stmt.run(
+      alerts.length,
+      criticalCount,
+      warningCount,
+      infoCount,
+      JSON.stringify(alerts),
+      auditData.topologySnapshot ? JSON.stringify(auditData.topologySnapshot) : null,
+      auditData.timestamp || Date.now(),
+      function(err) {
+        if (err) return reject(err);
+        resolve({
+          id: this.lastID,
+          totalAlerts: alerts.length,
+          criticalCount,
+          warningCount,
+          infoCount,
+          timestamp: auditData.timestamp || Date.now()
+        });
+      }
+    );
+  });
+}
+
+function listAuditReports() {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT id, total_alerts, critical_count, warning_count, info_count, timestamp
+      FROM audit_reports
+      ORDER BY timestamp DESC
+      LIMIT 20
+    `, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        totalAlerts: row.total_alerts,
+        criticalCount: row.critical_count,
+        warningCount: row.warning_count,
+        infoCount: row.info_count,
+        timestamp: row.timestamp
+      })));
+    });
+  });
+}
+
+function getAuditReport(reportId) {
+  return new Promise((resolve, reject) => {
+    db.get(`
+      SELECT * FROM audit_reports WHERE id = ?
+    `, [reportId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+
+      resolve({
+        id: row.id,
+        totalAlerts: row.total_alerts,
+        criticalCount: row.critical_count,
+        warningCount: row.warning_count,
+        infoCount: row.info_count,
+        alerts: JSON.parse(row.alerts),
+        topologySnapshot: row.topology_snapshot ? JSON.parse(row.topology_snapshot) : null,
+        timestamp: row.timestamp
+      });
+    });
+  });
+}
+
+async function compareAuditReports(reportId1, reportId2) {
+  const report1 = await getAuditReport(reportId1);
+  const report2 = await getAuditReport(reportId2);
+
+  if (!report1 || !report2) {
+    return null;
+  }
+
+  function getAlertKey(alert) {
+    return `${alert.rule}:${alert.deviceIds ? alert.deviceIds.join(',') : ''}:${alert.linkIds ? alert.linkIds.join(',') : ''}`;
+  }
+
+  const alerts1Map = new Map();
+  report1.alerts.forEach(a => alerts1Map.set(getAlertKey(a), a));
+
+  const alerts2Map = new Map();
+  report2.alerts.forEach(a => alerts2Map.set(getAlertKey(a), a));
+
+  const allKeys = new Set([...alerts1Map.keys(), ...alerts2Map.keys()]);
+
+  const added = [];
+  const removed = [];
+  const changed = [];
+  const unchanged = [];
+
+  allKeys.forEach(key => {
+    const a1 = alerts1Map.get(key);
+    const a2 = alerts2Map.get(key);
+
+    if (!a1 && a2) {
+      added.push(a2);
+    } else if (a1 && !a2) {
+      removed.push(a1);
+    } else if (a1 && a2) {
+      if (JSON.stringify(a1) !== JSON.stringify(a2)) {
+        changed.push({ old: a1, new: a2 });
+      } else {
+        unchanged.push(a1);
+      }
+    }
+  });
+
+  return {
+    report1: {
+      id: report1.id,
+      totalAlerts: report1.totalAlerts,
+      criticalCount: report1.criticalCount,
+      warningCount: report1.warningCount,
+      infoCount: report1.infoCount,
+      timestamp: report1.timestamp
+    },
+    report2: {
+      id: report2.id,
+      totalAlerts: report2.totalAlerts,
+      criticalCount: report2.criticalCount,
+      warningCount: report2.warningCount,
+      infoCount: report2.infoCount,
+      timestamp: report2.timestamp
+    },
+    added,
+    removed,
+    changed,
+    unchanged
+  };
+}
+
 module.exports = {
   initDatabase,
   saveTopology,
@@ -363,5 +596,12 @@ module.exports = {
   saveReport,
   listReports,
   getReport,
-  compareReports
+  compareReports,
+  saveDeviceConfig,
+  listDeviceConfigs,
+  getDeviceConfig,
+  saveAuditReport,
+  listAuditReports,
+  getAuditReport,
+  compareAuditReports
 };

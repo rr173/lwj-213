@@ -131,6 +131,28 @@
                 </div>
             </div>
 
+            <h3>配置上传与自动发现</h3>
+            <div class="config-upload-panel">
+                <div class="form-group">
+                    <label>设备配置JSON</label>
+                    <textarea id="configInput" placeholder="粘贴设备配置JSON，格式：[{&quot;name&quot;:&quot;R1&quot;,&quot;type&quot;:&quot;router&quot;,&quot;interfaces&quot;:[...]}]" style="width:100%;height:120px;font-size:11px;font-family:monospace;padding:6px;border:1px solid #d9d9d9;border-radius:4px;resize:vertical;"></textarea>
+                </div>
+                <div class="io-panel">
+                    <button id="parseConfigBtn" class="btn btn-primary">解析并生成拓扑</button>
+                    <button id="loadConfigFileBtn" class="btn">从文件加载</button>
+                    <input type="file" id="configFileInput" accept=".json,.txt" style="display:none;">
+                </div>
+                <div class="form-group" style="margin-top:10px;">
+                    <label>自动布局方式</label>
+                    <select id="layoutMode">
+                        <option value="force">力导向布局</option>
+                        <option value="ring">环形布局</option>
+                        <option value="grid">网格布局</option>
+                    </select>
+                </div>
+                <div id="configParseResult" class="parse-result" style="display:none;margin-top:8px;"></div>
+            </div>
+
             <h3>导入导出</h3>
             <div class="io-panel">
                 <button id="exportBtn" class="btn">导出JSON</button>
@@ -213,6 +235,24 @@
                 <div id="batchFaultHint" class="batch-hint" style="display:none;">
                     批量模式：点击链路切换状态，完成后点击"应用"
                 </div>
+            </div>
+
+            <h3>配置审计报告</h3>
+            <div class="audit-panel">
+                <div class="audit-actions">
+                    <button id="runAuditBtn" class="btn btn-small btn-primary">重新审计</button>
+                    <button id="exportAuditBtn" class="btn btn-small">导出JSON</button>
+                </div>
+                <div class="audit-summary" id="auditSummary" style="display:none;"></div>
+                <div class="audit-alerts" id="auditAlerts"></div>
+                <div class="audit-tabs" id="auditTabs" style="display:none;">
+                    <button class="audit-tab active" data-audit-tab="current">当前审计</button>
+                    <button class="audit-tab" data-audit-tab="history">历史记录</button>
+                    <button class="audit-tab" data-audit-tab="compare">审计对比</button>
+                </div>
+                <div class="audit-tab-content" id="audit-tab-current"></div>
+                <div class="audit-tab-content" id="audit-tab-history" style="display:none;"></div>
+                <div class="audit-tab-content" id="audit-tab-compare" style="display:none;"></div>
             </div>
 
             <h3>压测报告</h3>

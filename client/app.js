@@ -2895,11 +2895,1177 @@ generateReport = function(aborted = false) {
     }
 };
 
-const originalInit2 = init;
+let parsedDeviceConfigs = new Map();
+let currentAuditReport = null;
+let auditHistory = [];
+let highlightedElements = { devices: [], links: [] };
+let highlightTimer = null;
+
+const AUDIT_RULES = {
+    SINGLE_POINT_OF_FAILURE: 'single_point_of_failure',
+    ASYMMETRIC_BANDWIDTH: 'asymmetric_bandwidth',
+    LOOP_RISK: 'loop_risk',
+    IP_CONFLICT: 'ip_conflict',
+    DOWN_INTERFACE: 'down_interface'
+};
+
+function setupConfigAuditEvents() {
+    document.getElementById('parseConfigBtn').addEventListener('click', parseAndGenerateTopology);
+    document.getElementById('loadConfigFileBtn').addEventListener('click', () => {
+        document.getElementById('configFileInput').click();
+    });
+    document.getElementById('configFileInput').addEventListener('change', loadConfigFile);
+
+    document.getElementById('runAuditBtn').addEventListener('click', runAudit);
+    document.getElementById('exportAuditBtn').addEventListener('click', exportAuditReport);
+
+    document.querySelectorAll('.audit-tab').forEach(tab => {
+        tab.addEventListener('click', (e) => {
+            const tabName = e.target.dataset.auditTab;
+            switchAuditTab(tabName);
+        });
+    });
+
+    document.getElementById('doAuditCompareBtn')?.addEventListener('click', doAuditCompare);
+}
+
+function loadConfigFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(event) {
+        document.getElementById('configInput').value = event.target.result;
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+}
+
+function parseAndGenerateTopology() {
+    const configText = document.getElementById('configInput').value.trim();
+    const resultEl = document.getElementById('configParseResult');
+
+    if (!configText) {
+        showParseResult('请输入设备配置JSON', 'error');
+        return;
+    }
+
+    try {
+        const configData = JSON.parse(configText);
+
+        if (!Array.isArray(configData)) {
+            throw new Error('配置必须是设备对象数组');
+        }
+
+        const validation = validateDeviceConfig(configData);
+        if (!validation.valid) {
+            throw new Error(validation.errors.join('\n'));
+        }
+
+        const layoutMode = document.getElementById('layoutMode').value;
+        const result = generateTopologyFromConfig(configData, layoutMode);
+
+        saveConfigToBackend(configData, result.devices, result.links);
+
+        showParseResult(`成功解析 ${result.devices.length} 台设备，${result.links.length} 条链路`, 'success');
+
+        setTimeout(() => {
+            runAudit();
+        }, 500);
+
+    } catch (err) {
+        showParseResult('解析失败: ' + err.message, 'error');
+    }
+}
+
+function validateDeviceConfig(configData) {
+    const errors = [];
+    const deviceNames = new Set();
+
+    configData.forEach((device, index) => {
+        if (!device.name) {
+            errors.push(`设备 #${index}: 缺少 name 字段`);
+        } else if (deviceNames.has(device.name)) {
+            errors.push(`设备 #${index}: 重复的设备名 ${device.name}`);
+        } else {
+            deviceNames.add(device.name);
+        }
+
+        if (!device.type || !['router', 'switch', 'host'].includes(device.type)) {
+            errors.push(`设备 ${device.name || '#' + index}: 无效的 type 字段，必须是 router/switch/host`);
+        }
+
+        if (!device.interfaces || !Array.isArray(device.interfaces)) {
+            errors.push(`设备 ${device.name || '#' + index}: 缺少 interfaces 数组`);
+        } else {
+            device.interfaces.forEach((iface, ifIndex) => {
+                if (!iface.name) {
+                    errors.push(`设备 ${device.name} 接口 #${ifIndex}: 缺少 name 字段`);
+                }
+                if (!iface.ip) {
+                    errors.push(`设备 ${device.name} 接口 ${iface.name || '#' + ifIndex}: 缺少 ip 字段`);
+                }
+                if (!iface.mask) {
+                    errors.push(`设备 ${device.name} 接口 ${iface.name || '#' + ifIndex}: 缺少 mask 字段`);
+                }
+                if (iface.bandwidth === undefined) {
+                    errors.push(`设备 ${device.name} 接口 ${iface.name || '#' + ifIndex}: 缺少 bandwidth 字段`);
+                }
+                if (!iface.status || !['up', 'down'].includes(iface.status)) {
+                    errors.push(`设备 ${device.name} 接口 ${iface.name || '#' + ifIndex}: 无效的 status 字段，必须是 up/down`);
+                }
+            });
+        }
+    });
+
+    return { valid: errors.length === 0, errors };
+}
+
+function ipToNumber(ip) {
+    return ip.split('.').reduce((acc, octet, index) => {
+        return acc + (parseInt(octet) << (24 - index * 8));
+    }, 0);
+}
+
+function getNetworkAddress(ip, mask) {
+    const ipNum = ipToNumber(ip);
+    const maskNum = ipToNumber(mask);
+    const networkNum = ipNum & maskNum;
+    return [
+        (networkNum >>> 24) & 255,
+        (networkNum >>> 16) & 255,
+        (networkNum >>> 8) & 255,
+        networkNum & 255
+    ].join('.');
+}
+
+function isSameSubnet(ip1, mask1, ip2, mask2) {
+    return getNetworkAddress(ip1, mask1) === getNetworkAddress(ip2, mask2);
+}
+
+function generateTopologyFromConfig(configData, layoutMode) {
+    const nameToDevice = new Map();
+    const newDevices = [];
+    const newLinks = [];
+    const interfaceMap = new Map();
+
+    let nextDeviceId = Math.max(...devices.map(d => d.id), 0) + 1;
+    let nextLinkId = Math.max(...links.map(l => l.id), 0) + 1;
+
+    configData.forEach(deviceConfig => {
+        const device = {
+            id: nextDeviceId++,
+            type: deviceConfig.type,
+            name: deviceConfig.name,
+            x: 0,
+            y: 0
+        };
+        newDevices.push(device);
+        nameToDevice.set(deviceConfig.name, device);
+
+        parsedDeviceConfigs.set(device.id, {
+            name: deviceConfig.name,
+            type: deviceConfig.type,
+            interfaces: deviceConfig.interfaces
+        });
+
+        deviceConfig.interfaces.forEach(iface => {
+            const key = `${deviceConfig.name}:${iface.name}`;
+            interfaceMap.set(key, {
+                deviceId: device.id,
+                deviceName: deviceConfig.name,
+                interfaceName: iface.name,
+                ip: iface.ip,
+                mask: iface.mask,
+                bandwidth: iface.bandwidth,
+                status: iface.status,
+                peerDevice: iface.peerDevice
+            });
+        });
+    });
+
+    const linkCreated = new Set();
+
+    newDevices.forEach(device => {
+        const deviceConfig = parsedDeviceConfigs.get(device.id);
+        if (!deviceConfig) return;
+
+        deviceConfig.interfaces.forEach(iface => {
+            if (iface.peerDevice) {
+                const peerDevice = nameToDevice.get(iface.peerDevice);
+                if (peerDevice) {
+                    const linkKey = [device.id, peerDevice.id].sort().join('-');
+                    if (!linkCreated.has(linkKey)) {
+                        linkCreated.add(linkKey);
+
+                        const peerConfig = parsedDeviceConfigs.get(peerDevice.id);
+                        const peerIface = peerConfig?.interfaces.find(pi => pi.peerDevice === deviceConfig.name);
+                        const bandwidth = peerIface ? Math.min(iface.bandwidth, peerIface.bandwidth) : iface.bandwidth;
+
+                        const link = {
+                            id: nextLinkId++,
+                            from: device.id,
+                            to: peerDevice.id,
+                            bandwidth: bandwidth,
+                            delay: 10,
+                            enabled: iface.status === 'up' && (peerIface ? peerIface.status === 'up' : true),
+                            interfaceInfo: {
+                                [device.id]: { name: iface.name, ip: iface.ip, mask: iface.mask, bandwidth: iface.bandwidth, status: iface.status },
+                                [peerDevice.id]: { name: peerIface?.name, ip: peerIface?.ip, mask: peerIface?.mask, bandwidth: peerIface?.bandwidth, status: peerIface?.status }
+                            }
+                        };
+                        newLinks.push(link);
+                    }
+                }
+            }
+        });
+    });
+
+    const interfaces = Array.from(interfaceMap.values());
+    for (let i = 0; i < interfaces.length; i++) {
+        for (let j = i + 1; j < interfaces.length; j++) {
+            const if1 = interfaces[i];
+            const if2 = interfaces[j];
+
+            if (if1.deviceId === if2.deviceId) continue;
+
+            const linkKey = [if1.deviceId, if2.deviceId].sort().join('-');
+            if (linkCreated.has(linkKey)) continue;
+
+            if (isSameSubnet(if1.ip, if1.mask, if2.ip, if2.mask)) {
+                linkCreated.add(linkKey);
+
+                const bandwidth = Math.min(if1.bandwidth, if2.bandwidth);
+                const link = {
+                    id: nextLinkId++,
+                    from: if1.deviceId,
+                    to: if2.deviceId,
+                    bandwidth: bandwidth,
+                    delay: 10,
+                    enabled: if1.status === 'up' && if2.status === 'up',
+                    interfaceInfo: {
+                        [if1.deviceId]: { name: if1.interfaceName, ip: if1.ip, mask: if1.mask, bandwidth: if1.bandwidth, status: if1.status },
+                        [if2.deviceId]: { name: if2.interfaceName, ip: if2.ip, mask: if2.mask, bandwidth: if2.bandwidth, status: if2.status }
+                    }
+                };
+                newLinks.push(link);
+            }
+        }
+    }
+
+    applyLayout(newDevices, newLinks, layoutMode);
+
+    devices.length = 0;
+    links.length = 0;
+    devices.push(...newDevices);
+    links.push(...newLinks);
+
+    deviceIdCounter = nextDeviceId;
+    linkIdCounter = nextLinkId;
+
+    updateDeviceCount();
+    updateDeviceSelects();
+    recalculateRoutes();
+    updateFaultStats();
+
+    return { devices: newDevices, links: newLinks };
+}
+
+function applyLayout(newDevices, newLinks, layoutMode) {
+    const canvasWidth = canvas.width / scale;
+    const canvasHeight = canvas.height / scale;
+    const centerX = canvasWidth / 2;
+    const centerY = canvasHeight / 2;
+
+    if (layoutMode === 'ring') {
+        applyRingLayout(newDevices, centerX, centerY);
+    } else if (layoutMode === 'grid') {
+        applyGridLayout(newDevices, centerX, centerY);
+    } else {
+        applyForceLayout(newDevices, newLinks, centerX, centerY);
+    }
+}
+
+function applyRingLayout(devices, centerX, centerY) {
+    const radius = Math.min(centerX, centerY) * 0.7;
+    const angleStep = (2 * Math.PI) / devices.length;
+
+    devices.forEach((device, index) => {
+        const angle = index * angleStep - Math.PI / 2;
+        device.x = centerX + radius * Math.cos(angle);
+        device.y = centerY + radius * Math.sin(angle);
+    });
+}
+
+function applyGridLayout(devices, centerX, centerY) {
+    const cols = Math.ceil(Math.sqrt(devices.length));
+    const rows = Math.ceil(devices.length / cols);
+    const spacing = Math.min(centerX, centerY) * 0.8 / Math.max(cols, rows);
+    const startX = centerX - ((cols - 1) * spacing) / 2;
+    const startY = centerY - ((rows - 1) * spacing) / 2;
+
+    devices.forEach((device, index) => {
+        const col = index % cols;
+        const row = Math.floor(index / cols);
+        device.x = startX + col * spacing;
+        device.y = startY + row * spacing;
+    });
+}
+
+function applyForceLayout(devices, links, centerX, centerY) {
+    applyRingLayout(devices, centerX, centerY);
+
+    const iterations = 100;
+    const k = Math.sqrt((canvas.width * canvas.height) / (scale * scale * devices.length)) * 0.5;
+
+    for (let iter = 0; iter < iterations; iter++) {
+        const forces = devices.map(() => ({ x: 0, y: 0 }));
+
+        for (let i = 0; i < devices.length; i++) {
+            for (let j = i + 1; j < devices.length; j++) {
+                const dx = devices[i].x - devices[j].x;
+                const dy = devices[i].y - devices[j].y;
+                const dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
+                const repulsion = (k * k) / dist;
+
+                forces[i].x += (dx / dist) * repulsion;
+                forces[i].y += (dy / dist) * repulsion;
+                forces[j].x -= (dx / dist) * repulsion;
+                forces[j].y -= (dy / dist) * repulsion;
+            }
+        }
+
+        links.forEach(link => {
+            const fromIdx = devices.findIndex(d => d.id === link.from);
+            const toIdx = devices.findIndex(d => d.id === link.to);
+            if (fromIdx === -1 || toIdx === -1) return;
+
+            const dx = devices[toIdx].x - devices[fromIdx].x;
+            const dy = devices[toIdx].y - devices[fromIdx].y;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 0.1;
+            const attraction = (dist * dist) / k;
+
+            forces[fromIdx].x += (dx / dist) * attraction;
+            forces[fromIdx].y += (dy / dist) * attraction;
+            forces[toIdx].x -= (dx / dist) * attraction;
+            forces[toIdx].y -= (dy / dist) * attraction;
+        });
+
+        devices.forEach((device, i) => {
+            const cx = centerX - device.x;
+            const cy = centerY - device.y;
+            forces[i].x += cx * 0.01;
+            forces[i].y += cy * 0.01;
+        });
+
+        const temperature = 1 - iter / iterations;
+        devices.forEach((device, i) => {
+            const fx = forces[i].x;
+            const fy = forces[i].y;
+            const forceMag = Math.sqrt(fx * fx + fy * fy) || 0.1;
+            const maxMove = temperature * 50;
+
+            device.x += (fx / forceMag) * Math.min(forceMag, maxMove);
+            device.y += (fy / forceMag) * Math.min(forceMag, maxMove);
+
+            const margin = 50;
+            device.x = Math.max(margin, Math.min(canvas.width / scale - margin, device.x));
+            device.y = Math.max(margin, Math.min(canvas.height / scale - margin, device.y));
+        });
+    }
+}
+
+async function saveConfigToBackend(configData, parsedDevices, parsedLinks) {
+    const result = await apiRequest('/configs', {
+        method: 'POST',
+        body: JSON.stringify({
+            configData,
+            parsedDevices: parsedDevices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
+            parsedLinks: parsedLinks.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled }))
+        })
+    });
+
+    if (result.success) {
+        addLog(`配置已保存到后端，ID: ${result.data.id}`, 'success');
+    } else {
+        addLog('保存配置到后端失败: ' + (result.error || '未知错误'), 'error');
+    }
+}
+
+function showParseResult(message, type) {
+    const resultEl = document.getElementById('configParseResult');
+    resultEl.textContent = message;
+    resultEl.className = `parse-result ${type}`;
+    resultEl.style.display = 'block';
+
+    if (type === 'success') {
+        setTimeout(() => {
+            resultEl.style.display = 'none';
+        }, 5000);
+    }
+}
+
+function runAudit() {
+    if (devices.length === 0) {
+        showAuditEmpty();
+        return;
+    }
+
+    const alerts = [];
+
+    alerts.push(...checkSinglePointOfFailure());
+    alerts.push(...checkAsymmetricBandwidth());
+    alerts.push(...checkLoopRisk());
+    alerts.push(...checkIpConflict());
+    alerts.push(...checkDownInterface());
+
+    const auditReport = {
+        timestamp: Date.now(),
+        totalAlerts: alerts.length,
+        criticalCount: alerts.filter(a => a.level === 'critical').length,
+        warningCount: alerts.filter(a => a.level === 'warning').length,
+        infoCount: alerts.filter(a => a.level === 'info').length,
+        alerts: alerts,
+        topologySnapshot: {
+            devices: devices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
+            links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled }))
+        }
+    };
+
+    currentAuditReport = auditReport;
+
+    saveAuditToBackend(auditReport);
+
+    renderAuditReport(auditReport);
+
+    if (alerts.length > 0) {
+        addLog(`审计完成，发现 ${alerts.length} 个问题 (严重:${auditReport.criticalCount}, 警告:${auditReport.warningCount}, 提示:${auditReport.infoCount})`, 
+            auditReport.criticalCount > 0 ? 'error' : (auditReport.warningCount > 0 ? 'warning' : 'info'));
+    } else {
+        addLog('审计完成，未发现配置问题', 'success');
+    }
+}
+
+function checkSinglePointOfFailure() {
+    const alerts = [];
+    const deviceLinkCount = new Map();
+
+    links.forEach(link => {
+        if (!link.enabled) return;
+        deviceLinkCount.set(link.from, (deviceLinkCount.get(link.from) || 0) + 1);
+        deviceLinkCount.set(link.to, (deviceLinkCount.get(link.to) || 0) + 1);
+    });
+
+    devices.forEach(device => {
+        const count = deviceLinkCount.get(device.id) || 0;
+        if (count === 1) {
+            alerts.push({
+                id: `${AUDIT_RULES.SINGLE_POINT_OF_FAILURE}-${device.id}`,
+                rule: AUDIT_RULES.SINGLE_POINT_OF_FAILURE,
+                level: 'warning',
+                deviceIds: [device.id],
+                linkIds: [],
+                title: '单点故障风险',
+                description: `设备 ${device.name} 只有 ${count} 条有效链路连接到网络，一旦该链路中断，设备将被孤立。`,
+                timestamp: Date.now()
+            });
+        } else if (count === 0 && devices.length > 1) {
+            alerts.push({
+                id: `${AUDIT_RULES.SINGLE_POINT_OF_FAILURE}-${device.id}-isolated`,
+                rule: AUDIT_RULES.SINGLE_POINT_OF_FAILURE,
+                level: 'critical',
+                deviceIds: [device.id],
+                linkIds: [],
+                title: '设备已孤立',
+                description: `设备 ${device.name} 没有任何有效链路连接，已完全孤立于网络之外。`,
+                timestamp: Date.now()
+            });
+        }
+    });
+
+    return alerts;
+}
+
+function checkAsymmetricBandwidth() {
+    const alerts = [];
+
+    links.forEach(link => {
+        if (!link.interfaceInfo) return;
+
+        const fromInfo = link.interfaceInfo[link.from];
+        const toInfo = link.interfaceInfo[link.to];
+
+        if (!fromInfo || !toInfo) return;
+
+        if (fromInfo.bandwidth !== toInfo.bandwidth) {
+            const fromDevice = devices.find(d => d.id === link.from);
+            const toDevice = devices.find(d => d.id === link.to);
+
+            alerts.push({
+                id: `${AUDIT_RULES.ASYMMETRIC_BANDWIDTH}-${link.id}`,
+                rule: AUDIT_RULES.ASYMMETRIC_BANDWIDTH,
+                level: 'warning',
+                deviceIds: [link.from, link.to],
+                linkIds: [link.id],
+                title: '非对称带宽配置',
+                description: `链路 ${fromDevice?.name || link.from} ↔ ${toDevice?.name || link.to} 两端带宽配置不一致：${fromInfo.bandwidth}Mbps vs ${toInfo.bandwidth}Mbps。这可能导致流量不均衡。`,
+                timestamp: Date.now()
+            });
+        }
+    });
+
+    return alerts;
+}
+
+function checkLoopRisk() {
+    const alerts = [];
+
+    function findCycles() {
+        const adjList = new Map();
+        devices.forEach(d => adjList.set(d.id, []));
+        links.forEach(link => {
+            if (!link.enabled) return;
+            adjList.get(link.from)?.push({ node: link.to, linkId: link.id });
+            adjList.get(link.to)?.push({ node: link.from, linkId: link.id });
+        });
+
+        const cycles = [];
+        const visited = new Set();
+        const path = [];
+        const pathSet = new Set();
+
+        function dfs(node, parent) {
+            visited.add(node);
+            path.push(node);
+            pathSet.add(node);
+
+            const neighbors = adjList.get(node) || [];
+            for (const { node: neighbor, linkId } of neighbors) {
+                if (neighbor === parent) continue;
+
+                if (pathSet.has(neighbor)) {
+                    const cycleStartIdx = path.indexOf(neighbor);
+                    if (cycleStartIdx !== -1) {
+                        const cycleNodes = path.slice(cycleStartIdx);
+                        if (cycleNodes.length >= 3) {
+                            const cycleLinkIds = [];
+                            for (let i = 0; i < cycleNodes.length; i++) {
+                                const curr = cycleNodes[i];
+                                const next = cycleNodes[(i + 1) % cycleNodes.length];
+                                const edge = adjList.get(curr)?.find(e => e.node === next);
+                                if (edge) cycleLinkIds.push(edge.linkId);
+                            }
+                            cycles.push({ nodes: cycleNodes, links: cycleLinkIds });
+                        }
+                    }
+                } else if (!visited.has(neighbor)) {
+                    dfs(neighbor, node);
+                }
+            }
+
+            path.pop();
+            pathSet.delete(node);
+        }
+
+        devices.forEach(d => {
+            if (!visited.has(d.id)) {
+                dfs(d.id, null);
+            }
+        });
+
+        const uniqueCycles = [];
+        const seen = new Set();
+        cycles.forEach(cycle => {
+            const key = [...cycle.nodes].sort().join(',');
+            if (!seen.has(key)) {
+                seen.add(key);
+                uniqueCycles.push(cycle);
+            }
+        });
+
+        return uniqueCycles;
+    }
+
+    const cycles = findCycles();
+
+    cycles.forEach(cycle => {
+        const hasBackupLink = cycle.links.some(linkId => {
+            const link = links.find(l => l.id === linkId);
+            return link && !link.enabled;
+        });
+
+        if (!hasBackupLink) {
+            const nodeNames = cycle.nodes.map(id => {
+                const d = devices.find(dev => dev.id === id);
+                return d?.name || id;
+            });
+
+            alerts.push({
+                id: `${AUDIT_RULES.LOOP_RISK}-${cycle.nodes.join('-')}`,
+                rule: AUDIT_RULES.LOOP_RISK,
+                level: 'critical',
+                deviceIds: cycle.nodes,
+                linkIds: cycle.links,
+                title: '环路风险',
+                description: `检测到由 ${cycle.nodes.length} 个节点构成的环路：${nodeNames.join(' → ')}。该环路中没有任何链路被标记为备份，可能导致广播风暴。`,
+                timestamp: Date.now()
+            });
+        }
+    });
+
+    return alerts;
+}
+
+function checkIpConflict() {
+    const alerts = [];
+    const ipMap = new Map();
+
+    parsedDeviceConfigs.forEach((config, deviceId) => {
+        config.interfaces.forEach(iface => {
+            if (!iface.ip) return;
+
+            if (!ipMap.has(iface.ip)) {
+                ipMap.set(iface.ip, []);
+            }
+            ipMap.get(iface.ip).push({
+                deviceId,
+                deviceName: config.name,
+                interfaceName: iface.name
+            });
+        });
+    });
+
+    ipMap.forEach((entries, ip) => {
+        if (entries.length > 1) {
+            const conflictDevices = entries.map(e => `${e.deviceName}(${e.interfaceName})`);
+            const deviceIds = entries.map(e => e.deviceId);
+
+            alerts.push({
+                id: `${AUDIT_RULES.IP_CONFLICT}-${ip}`,
+                rule: AUDIT_RULES.IP_CONFLICT,
+                level: 'critical',
+                deviceIds: deviceIds,
+                linkIds: [],
+                title: 'IP地址冲突',
+                description: `IP地址 ${ip} 被 ${entries.length} 个接口同时使用：${conflictDevices.join('、')}。这将导致严重的网络通信问题。`,
+                timestamp: Date.now()
+            });
+        }
+    });
+
+    return alerts;
+}
+
+function checkDownInterface() {
+    const alerts = [];
+
+    links.forEach(link => {
+        if (!link.interfaceInfo) return;
+
+        const fromInfo = link.interfaceInfo[link.from];
+        const toInfo = link.interfaceInfo[link.to];
+
+        if (!fromInfo || !toInfo) return;
+
+        const fromDevice = devices.find(d => d.id === link.from);
+        const toDevice = devices.find(d => d.id === link.to);
+
+        if (fromInfo.status === 'down' && toInfo.status === 'up') {
+            alerts.push({
+                id: `${AUDIT_RULES.DOWN_INTERFACE}-${link.id}-from`,
+                rule: AUDIT_RULES.DOWN_INTERFACE,
+                level: 'warning',
+                deviceIds: [link.from, link.to],
+                linkIds: [link.id],
+                title: '接口状态异常',
+                description: `链路 ${fromDevice?.name || link.from}(${fromInfo.name}) 状态为 down，但对端 ${toDevice?.name || link.to}(${toInfo.name}) 状态为 up。可能存在一侧配置异常或物理链路问题。`,
+                timestamp: Date.now()
+            });
+        } else if (fromInfo.status === 'up' && toInfo.status === 'down') {
+            alerts.push({
+                id: `${AUDIT_RULES.DOWN_INTERFACE}-${link.id}-to`,
+                rule: AUDIT_RULES.DOWN_INTERFACE,
+                level: 'warning',
+                deviceIds: [link.from, link.to],
+                linkIds: [link.id],
+                title: '接口状态异常',
+                description: `链路 ${fromDevice?.name || link.from}(${fromInfo.name}) 状态为 up，但对端 ${toDevice?.name || link.to}(${toInfo.name}) 状态为 down。可能存在一侧配置异常或物理链路问题。`,
+                timestamp: Date.now()
+            });
+        }
+    });
+
+    parsedDeviceConfigs.forEach((config, deviceId) => {
+        config.interfaces.forEach(iface => {
+            if (iface.status === 'down' && !iface.peerDevice) {
+                const hasLink = links.some(link => {
+                    if (!link.interfaceInfo) return false;
+                    const info = link.interfaceInfo[deviceId];
+                    return info && info.name === iface.name;
+                });
+
+                if (!hasLink) {
+                    alerts.push({
+                        id: `${AUDIT_RULES.DOWN_INTERFACE}-${deviceId}-${iface.name}`,
+                        rule: AUDIT_RULES.DOWN_INTERFACE,
+                        level: 'info',
+                        deviceIds: [deviceId],
+                        linkIds: [],
+                        title: '接口未启用',
+                        description: `设备 ${config.name} 的接口 ${iface.name} 状态为 down 且未连接到任何对端设备。`,
+                        timestamp: Date.now()
+                    });
+                }
+            }
+        });
+    });
+
+    return alerts;
+}
+
+async function saveAuditToBackend(auditReport) {
+    const result = await apiRequest('/audits', {
+        method: 'POST',
+        body: JSON.stringify(auditReport)
+    });
+
+    if (result.success) {
+        addLog(`审计报告已保存到后端，ID: ${result.data.id}`, 'success');
+        currentAuditReport.id = result.data.id;
+        return result.data;
+    } else {
+        addLog('保存审计报告到后端失败: ' + (result.error || '未知错误'), 'error');
+        return null;
+    }
+}
+
+function showAuditEmpty() {
+    const alertsEl = document.getElementById('auditAlerts');
+    const summaryEl = document.getElementById('auditSummary');
+    const tabsEl = document.getElementById('auditTabs');
+
+    summaryEl.style.display = 'none';
+    tabsEl.style.display = 'none';
+    alertsEl.innerHTML = '<div class="audit-empty">暂无拓扑数据，请先创建设备或上传配置</div>';
+}
+
+function renderAuditReport(report) {
+    const summaryEl = document.getElementById('auditSummary');
+    const alertsEl = document.getElementById('auditAlerts');
+    const tabsEl = document.getElementById('auditTabs');
+
+    summaryEl.style.display = 'grid';
+    tabsEl.style.display = 'flex';
+
+    summaryEl.innerHTML = `
+        <div class="audit-summary-item critical">
+            <div class="audit-summary-count">${report.criticalCount}</div>
+            <div class="audit-summary-label">严重</div>
+        </div>
+        <div class="audit-summary-item warning">
+            <div class="audit-summary-count">${report.warningCount}</div>
+            <div class="audit-summary-label">警告</div>
+        </div>
+        <div class="audit-summary-item info">
+            <div class="audit-summary-count">${report.infoCount}</div>
+            <div class="audit-summary-label">提示</div>
+        </div>
+    `;
+
+    if (report.alerts.length === 0) {
+        alertsEl.innerHTML = '<div class="audit-empty">🎉 恭喜！未发现任何配置问题</div>';
+        return;
+    }
+
+    const grouped = {
+        critical: report.alerts.filter(a => a.level === 'critical'),
+        warning: report.alerts.filter(a => a.level === 'warning'),
+        info: report.alerts.filter(a => a.level === 'info')
+    };
+
+    let html = '';
+    const levelNames = { critical: '严重', warning: '警告', info: '提示' };
+    const levelOrder = ['critical', 'warning', 'info'];
+
+    levelOrder.forEach(level => {
+        const alerts = grouped[level];
+        if (alerts.length === 0) return;
+
+        html += `
+            <div class="audit-alert-group">
+                <div class="audit-alert-group-header ${level}">
+                    <span>${levelNames[level]} (${alerts.length})</span>
+                </div>
+        `;
+
+        alerts.forEach(alert => {
+            const deviceNames = alert.deviceIds?.map(id => {
+                const d = devices.find(dev => dev.id === id);
+                return d?.name || id;
+            }).join('、') || '-';
+
+            html += `
+                <div class="audit-alert-item ${level}" 
+                     onclick="highlightAlertElements(${JSON.stringify(alert).replace(/"/g, '&quot;')})"
+                     title="点击高亮显示相关设备和链路">
+                    <div class="audit-alert-title">${escapeHtml(alert.title)}</div>
+                    <div class="audit-alert-desc">${escapeHtml(alert.description)}</div>
+                    <div class="audit-alert-desc" style="margin-top:4px;color:#888;">
+                        涉及设备: ${escapeHtml(deviceNames)}
+                    </div>
+                    <span class="audit-alert-tag ${level}">${levelNames[level]}</span>
+                </div>
+            `;
+        });
+
+        html += `</div>`;
+    });
+
+    alertsEl.innerHTML = html;
+}
+
+window.highlightAlertElements = function(alert) {
+    clearHighlight();
+
+    const deviceIds = alert.deviceIds || [];
+    const linkIds = alert.linkIds || [];
+
+    deviceIds.forEach(id => {
+        const device = devices.find(d => d.id === id);
+        if (device) highlightedElements.devices.push(device);
+    });
+
+    linkIds.forEach(id => {
+        const link = links.find(l => l.id === id);
+        if (link) highlightedElements.links.push(link);
+    });
+
+    addLog(`高亮显示告警相关的 ${highlightedElements.devices.length} 个设备和 ${highlightedElements.links.length} 条链路`, 'info');
+
+    highlightTimer = setTimeout(() => {
+        clearHighlight();
+    }, 3000);
+};
+
+function clearHighlight() {
+    highlightedElements.devices = [];
+    highlightedElements.links = [];
+    if (highlightTimer) {
+        clearTimeout(highlightTimer);
+        highlightTimer = null;
+    }
+}
+
+const originalDrawDevice = drawDevice;
+drawDevice = function(device) {
+    if (highlightedElements.devices.includes(device)) {
+        ctx.save();
+        ctx.translate(device.x, device.y);
+        const flash = Math.sin(Date.now() / 100) > 0;
+        ctx.beginPath();
+        ctx.arc(0, 0, DEVICE_RADIUS + 10, 0, Math.PI * 2);
+        ctx.strokeStyle = flash ? '#ff0000' : '#ffff00';
+        ctx.lineWidth = 4;
+        ctx.stroke();
+        ctx.restore();
+    }
+    originalDrawDevice(device);
+};
+
+const originalDrawLink = drawLink;
+drawLink = function(link) {
+    if (highlightedElements.links.includes(link)) {
+        const from = devices.find(d => d.id === link.from);
+        const to = devices.find(d => d.id === link.to);
+        if (from && to) {
+            const flash = Math.sin(Date.now() / 100) > 0;
+            ctx.strokeStyle = flash ? '#ff0000' : '#ffff00';
+            ctx.lineWidth = 8;
+            ctx.lineCap = 'round';
+            ctx.beginPath();
+            ctx.moveTo(from.x, from.y);
+            ctx.lineTo(to.x, to.y);
+            ctx.stroke();
+        }
+    }
+    originalDrawLink(link);
+};
+
+function exportAuditReport() {
+    if (!currentAuditReport) {
+        alert('没有可导出的审计报告，请先运行审计');
+        return;
+    }
+
+    const json = JSON.stringify(currentAuditReport, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `audit_report_${Date.now()}.json`;
+    a.click();
+
+    URL.revokeObjectURL(url);
+    addLog('审计报告已导出', 'success');
+}
+
+function switchAuditTab(tabName) {
+    document.querySelectorAll('.audit-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.auditTab === tabName);
+    });
+
+    document.querySelectorAll('.audit-tab-content').forEach(content => {
+        content.style.display = 'none';
+    });
+
+    document.getElementById('audit-tab-' + tabName).style.display = 'block';
+
+    if (tabName === 'history') {
+        loadAuditHistory();
+    } else if (tabName === 'compare') {
+        loadAuditCompareOptions();
+    }
+}
+
+async function loadAuditHistory() {
+    const result = await apiRequest('/audits');
+    if (result.success) {
+        auditHistory = result.data;
+        renderAuditHistory();
+    }
+}
+
+function renderAuditHistory() {
+    const container = document.getElementById('audit-tab-history');
+
+    if (auditHistory.length === 0) {
+        container.innerHTML = '<div class="audit-empty">暂无历史审计记录</div>';
+        return;
+    }
+
+    let html = '<div class="audit-history-list">';
+
+    auditHistory.forEach(audit => {
+        const date = new Date(audit.timestamp).toLocaleString();
+        html += `
+            <div class="audit-history-item" onclick="loadAuditHistoryDetail(${audit.id})">
+                <div class="audit-history-header">
+                    <span style="font-weight:500;">审计报告 #${audit.id}</span>
+                    <span class="audit-history-time">${date}</span>
+                </div>
+                <div class="audit-history-stats">
+                    <span>共 ${audit.totalAlerts} 个问题</span>
+                    <span class="audit-history-stat critical">严重: ${audit.criticalCount}</span>
+                    <span class="audit-history-stat warning">警告: ${audit.warningCount}</span>
+                    <span class="audit-history-stat info">提示: ${audit.infoCount}</span>
+                </div>
+            </div>
+        `;
+    });
+
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+window.loadAuditHistoryDetail = async function(auditId) {
+    const result = await apiRequest('/audits/' + auditId);
+    if (result.success) {
+        currentAuditReport = result.data;
+        renderAuditReport(result.data);
+        switchAuditTab('current');
+        addLog(`已加载历史审计报告 #${auditId}`, 'info');
+    }
+};
+
+async function loadAuditCompareOptions() {
+    await loadAuditHistory();
+
+    const container = document.getElementById('audit-tab-compare');
+
+    if (auditHistory.length < 2) {
+        container.innerHTML = '<div class="audit-empty">需要至少两份审计报告才能进行对比</div>';
+        return;
+    }
+
+    let html = `
+        <div class="audit-compare-selectors">
+            <div class="form-group">
+                <label>审计报告 A</label>
+                <select id="compareAudit1">
+                    <option value="">选择报告 A</option>
+                    ${auditHistory.map(a => {
+                        const date = new Date(a.timestamp).toLocaleString();
+                        return `<option value="${a.id}">#${a.id} - ${date} (${a.totalAlerts}个问题)</option>`;
+                    }).join('')}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>审计报告 B</label>
+                <select id="compareAudit2">
+                    <option value="">选择报告 B</option>
+                    ${auditHistory.map(a => {
+                        const date = new Date(a.timestamp).toLocaleString();
+                        return `<option value="${a.id}">#${a.id} - ${date} (${a.totalAlerts}个问题)</option>`;
+                    }).join('')}
+                </select>
+            </div>
+            <button id="doAuditCompareBtn" class="btn btn-primary">开始对比</button>
+        </div>
+        <div id="auditCompareResults" style="display:none;"></div>
+        <div id="auditCompareEmpty" class="audit-empty" style="display:none;">
+            选择两份审计报告进行对比
+        </div>
+    `;
+
+    container.innerHTML = html;
+
+    document.getElementById('doAuditCompareBtn').addEventListener('click', doAuditCompare);
+}
+
+async function doAuditCompare() {
+    const id1 = parseInt(document.getElementById('compareAudit1').value);
+    const id2 = parseInt(document.getElementById('compareAudit2').value);
+
+    if (!id1 || !id2) {
+        alert('请选择两份审计报告');
+        return;
+    }
+
+    if (id1 === id2) {
+        alert('请选择不同的报告进行对比');
+        return;
+    }
+
+    const result = await apiRequest(`/audits/compare/${id1}/${id2}`);
+    if (result.success) {
+        renderAuditCompareResults(result.data);
+    } else {
+        alert('对比失败: ' + (result.error || '未知错误'));
+    }
+}
+
+function renderAuditCompareResults(compareData) {
+    const resultsEl = document.getElementById('auditCompareResults');
+    const emptyEl = document.getElementById('auditCompareEmpty');
+
+    emptyEl.style.display = 'none';
+    resultsEl.style.display = 'block';
+
+    const { report1, report2, added, removed, changed } = compareData;
+
+    const date1 = new Date(report1.timestamp).toLocaleString();
+    const date2 = new Date(report2.timestamp).toLocaleString();
+
+    let html = `
+        <div class="audit-compare-results">
+            <div class="audit-compare-overview">
+                <h4>对比总览</h4>
+                <div class="audit-compare-stats">
+                    <div class="report-stat-row">
+                        <span class="report-stat-label">报告 A</span>
+                        <span class="report-stat-value">#${report1.id} - ${date1}</span>
+                    </div>
+                    <div class="report-stat-row">
+                        <span class="report-stat-label">报告 B</span>
+                        <span class="report-stat-value">#${report2.id} - ${date2}</span>
+                    </div>
+                    <div class="report-stat-row">
+                        <span class="report-stat-label">问题总数变化</span>
+                        <span class="report-stat-value" style="color: ${report2.totalAlerts > report1.totalAlerts ? '#ff4d4f' : (report2.totalAlerts < report1.totalAlerts ? '#52c41a' : '#333')};">
+                            ${report1.totalAlerts} → ${report2.totalAlerts}
+                            (${report2.totalAlerts > report1.totalAlerts ? '+' : ''}${report2.totalAlerts - report1.totalAlerts})
+                        </span>
+                    </div>
+                    <div class="report-stat-row">
+                        <span class="report-stat-label">严重问题变化</span>
+                        <span class="report-stat-value" style="color: ${report2.criticalCount > report1.criticalCount ? '#ff4d4f' : (report2.criticalCount < report1.criticalCount ? '#52c41a' : '#333')};">
+                            ${report1.criticalCount} → ${report2.criticalCount}
+                            (${report2.criticalCount > report1.criticalCount ? '+' : ''}${report2.criticalCount - report1.criticalCount})
+                        </span>
+                    </div>
+                </div>
+            </div>
+    `;
+
+    if (added.length > 0) {
+        html += `
+            <div class="audit-compare-alerts-section">
+                <h4>新增告警 (${added.length})</h4>
+        `;
+        added.forEach(alert => {
+            html += `
+                <div class="audit-compare-alert-item added" onclick="highlightAlertElements(${JSON.stringify(alert).replace(/"/g, '&quot;')})">
+                    <span class="audit-compare-badge added">新增</span>
+                    <span class="audit-alert-tag ${alert.level}">${alert.level === 'critical' ? '严重' : alert.level === 'warning' ? '警告' : '提示'}</span>
+                    <strong>${escapeHtml(alert.title)}</strong><br>
+                    <span style="color:#666;font-size:11px;">${escapeHtml(alert.description)}</span>
+                </div>
+            `;
+        });
+        html += `</div>`;
+    }
+
+    if (removed.length > 0) {
+        html += `
+            <div class="audit-compare-alerts-section">
+                <h4>已修复告警 (${removed.length})</h4>
+        `;
+        removed.forEach(alert => {
+            html += `
+                <div class="audit-compare-alert-item removed">
+                    <span class="audit-compare-badge removed">已修复</span>
+                    <span class="audit-alert-tag ${alert.level}">${alert.level === 'critical' ? '严重' : alert.level === 'warning' ? '警告' : '提示'}</span>
+                    <strong>${escapeHtml(alert.title)}</strong><br>
+                    <span style="color:#666;font-size:11px;">${escapeHtml(alert.description)}</span>
+                </div>
+            `;
+        });
+        html += `</div>`;
+    }
+
+    if (changed.length > 0) {
+        html += `
+            <div class="audit-compare-alerts-section">
+                <h4>有变化的告警 (${changed.length})</h4>
+        `;
+        changed.forEach(({ old: oldAlert, new: newAlert }) => {
+            html += `
+                <div class="audit-compare-alert-item changed" onclick="highlightAlertElements(${JSON.stringify(newAlert).replace(/"/g, '&quot;')})">
+                    <span class="audit-compare-badge changed">已变更</span>
+                    <span class="audit-alert-tag ${newAlert.level}">${newAlert.level === 'critical' ? '严重' : newAlert.level === 'warning' ? '警告' : '提示'}</span>
+                    <strong>${escapeHtml(newAlert.title)}</strong><br>
+                    <span style="color:#666;font-size:11px;">新: ${escapeHtml(newAlert.description)}</span>
+                </div>
+            `;
+        });
+        html += `</div>`;
+    }
+
+    if (added.length === 0 && removed.length === 0 && changed.length === 0) {
+        html += `
+            <div class="audit-empty" style="margin-top:10px;">
+                两份报告内容一致，没有差异
+            </div>
+        `;
+    }
+
+    html += `</div>`;
+    resultsEl.innerHTML = html;
+}
+
+const originalInit3 = init;
 init = function() {
-    originalInit2();
+    originalInit3();
     setupBackendEvents();
+    setupConfigAuditEvents();
     loadTopologyVersions();
+
+    if (devices.length > 0) {
+        setTimeout(() => runAudit(), 1000);
+    } else {
+        showAuditEmpty();
+    }
 };
 
 init();

@@ -10,7 +10,14 @@ const {
   saveReport,
   listReports,
   getReport,
-  compareReports
+  compareReports,
+  saveDeviceConfig,
+  listDeviceConfigs,
+  getDeviceConfig,
+  saveAuditReport,
+  listAuditReports,
+  getAuditReport,
+  compareAuditReports
 } = require('./database');
 
 const app = express();
@@ -168,6 +175,140 @@ app.get('/api/reports/compare/:id1/:id2', async (req, res) => {
     });
   } catch (err) {
     console.error('对比报告失败:', err);
+    res.status(500).json({ error: '对比失败' });
+  }
+});
+
+app.post('/api/configs', async (req, res) => {
+  try {
+    const { configData, parsedDevices, parsedLinks } = req.body;
+
+    if (!configData || !parsedDevices || !parsedLinks) {
+      return res.status(400).json({ error: '缺少必要字段: configData, parsedDevices, parsedLinks' });
+    }
+
+    const result = await saveDeviceConfig(configData, parsedDevices, parsedLinks);
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存配置失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/configs', async (req, res) => {
+  try {
+    const configs = await listDeviceConfigs();
+    res.json({
+      success: true,
+      data: configs
+    });
+  } catch (err) {
+    console.error('获取配置列表失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.get('/api/configs/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的配置ID' });
+    }
+
+    const config = await getDeviceConfig(id);
+    if (!config) {
+      return res.status(404).json({ error: '配置不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: config
+    });
+  } catch (err) {
+    console.error('获取配置失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.post('/api/audits', async (req, res) => {
+  try {
+    const auditData = req.body;
+
+    if (!auditData.alerts) {
+      return res.status(400).json({ error: '缺少审计告警数据' });
+    }
+
+    const result = await saveAuditReport(auditData);
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存审计报告失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/audits', async (req, res) => {
+  try {
+    const audits = await listAuditReports();
+    res.json({
+      success: true,
+      data: audits
+    });
+  } catch (err) {
+    console.error('获取审计列表失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.get('/api/audits/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的审计ID' });
+    }
+
+    const audit = await getAuditReport(id);
+    if (!audit) {
+      return res.status(404).json({ error: '审计报告不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: audit
+    });
+  } catch (err) {
+    console.error('获取审计报告失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.get('/api/audits/compare/:id1/:id2', async (req, res) => {
+  try {
+    const id1 = parseInt(req.params.id1);
+    const id2 = parseInt(req.params.id2);
+
+    if (isNaN(id1) || isNaN(id2)) {
+      return res.status(400).json({ error: '无效的审计ID' });
+    }
+
+    const result = await compareAuditReports(id1, id2);
+    if (!result) {
+      return res.status(404).json({ error: '审计报告不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('对比审计报告失败:', err);
     res.status(500).json({ error: '对比失败' });
   }
 });

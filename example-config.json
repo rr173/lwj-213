@@ -1,0 +1,66 @@
+[
+  {
+    "name": "R1",
+    "type": "router",
+    "interfaces": [
+      {"name": "GigabitEthernet0/0", "ip": "192.168.1.1", "mask": "255.255.255.0", "peerDevice": "R2", "bandwidth": 1000, "status": "up"},
+      {"name": "GigabitEthernet0/1", "ip": "192.168.2.1", "mask": "255.255.255.0", "peerDevice": "SW1", "bandwidth": 1000, "status": "up"},
+      {"name": "GigabitEthernet0/2", "ip": "192.168.10.1", "mask": "255.255.255.0", "bandwidth": 100, "status": "down"}
+    ]
+  },
+  {
+    "name": "R2",
+    "type": "router",
+    "interfaces": [
+      {"name": "GigabitEthernet0/0", "ip": "192.168.1.2", "mask": "255.255.255.0", "peerDevice": "R1", "bandwidth": 1000, "status": "up"},
+      {"name": "GigabitEthernet0/1", "ip": "192.168.3.1", "mask": "255.255.255.0", "peerDevice": "R3", "bandwidth": 500, "status": "up"},
+      {"name": "GigabitEthernet0/2", "ip": "192.168.4.1", "mask": "255.255.255.0", "peerDevice": "SW2", "bandwidth": 1000, "status": "down"}
+    ]
+  },
+  {
+    "name": "R3",
+    "type": "router",
+    "interfaces": [
+      {"name": "GigabitEthernet0/0", "ip": "192.168.3.2", "mask": "255.255.255.0", "peerDevice": "R2", "bandwidth": 500, "status": "up"},
+      {"name": "GigabitEthernet0/1", "ip": "192.168.5.1", "mask": "255.255.255.0", "peerDevice": "R1", "bandwidth": 1000, "status": "up"}
+    ]
+  },
+  {
+    "name": "SW1",
+    "type": "switch",
+    "interfaces": [
+      {"name": "GigabitEthernet1/0/1", "ip": "192.168.2.2", "mask": "255.255.255.0", "peerDevice": "R1", "bandwidth": 1000, "status": "up"},
+      {"name": "GigabitEthernet1/0/2", "ip": "192.168.2.3", "mask": "255.255.255.0", "peerDevice": "PC1", "bandwidth": 1000, "status": "up"},
+      {"name": "GigabitEthernet1/0/3", "ip": "192.168.2.4", "mask": "255.255.255.0", "peerDevice": "PC2", "bandwidth": 1000, "status": "up"}
+    ]
+  },
+  {
+    "name": "SW2",
+    "type": "switch",
+    "interfaces": [
+      {"name": "GigabitEthernet1/0/1", "ip": "192.168.4.2", "mask": "255.255.255.0", "peerDevice": "R2", "bandwidth": 1000, "status": "up"},
+      {"name": "GigabitEthernet1/0/2", "ip": "192.168.4.3", "mask": "255.255.255.0", "peerDevice": "PC3", "bandwidth": 1000, "status": "up"}
+    ]
+  },
+  {
+    "name": "PC1",
+    "type": "host",
+    "interfaces": [
+      {"name": "eth0", "ip": "192.168.2.10", "mask": "255.255.255.0", "peerDevice": "SW1", "bandwidth": 1000, "status": "up"}
+    ]
+  },
+  {
+    "name": "PC2",
+    "type": "host",
+    "interfaces": [
+      {"name": "eth0", "ip": "192.168.2.10", "mask": "255.255.255.0", "peerDevice": "SW1", "bandwidth": 1000, "status": "up"}
+    ]
+  },
+  {
+    "name": "PC3",
+    "type": "host",
+    "interfaces": [
+      {"name": "eth0", "ip": "192.168.4.10", "mask": "255.255.255.0", "peerDevice": "SW2", "bandwidth": 1000, "status": "up"}
+    ]
+  }
+]
