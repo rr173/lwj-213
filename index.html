@@ -50,6 +50,65 @@
                 </div>
             </div>
 
+            <h3>压测场景编排</h3>
+            <div class="scenario-panel">
+                <div class="scenario-header">
+                    <div class="form-group">
+                        <label>场景名称</label>
+                        <input type="text" id="scenarioName" placeholder="输入场景名称">
+                    </div>
+                    <div class="scenario-actions">
+                        <button id="createScenarioBtn" class="btn btn-small btn-primary">新建场景</button>
+                    </div>
+                </div>
+                <div class="scenario-list" id="scenarioList"></div>
+                <div class="scenario-editor" id="scenarioEditor" style="display:none;">
+                    <div class="scenario-editor-header">
+                        <span id="editingScenarioName"></span>
+                        <button id="closeScenarioEditor" class="btn-small">×</button>
+                    </div>
+                    <div class="event-form">
+                        <div class="form-group">
+                            <label>触发时刻(秒)</label>
+                            <input type="number" id="eventTime" value="0" min="0" step="0.1">
+                        </div>
+                        <div class="form-group">
+                            <label>源设备</label>
+                            <select id="eventSrc"></select>
+                        </div>
+                        <div class="form-group">
+                            <label>目的设备</label>
+                            <select id="eventDst"></select>
+                        </div>
+                        <div class="form-group">
+                            <label>数据量(KB)</label>
+                            <input type="number" id="eventDataSize" value="1000" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label>速率(Mbps)</label>
+                            <input type="number" id="eventRate" value="10" min="1">
+                        </div>
+                        <button id="addEventBtn" class="btn btn-small btn-primary">添加事件</button>
+                    </div>
+                    <div class="event-list-title">事件列表（按触发时刻排序）</div>
+                    <div class="event-list" id="eventList"></div>
+                    <div class="scenario-run-actions">
+                        <button id="runScenarioBtn" class="btn btn-primary">开始压测</button>
+                        <button id="stopScenarioBtn" class="btn" style="display:none;">中止</button>
+                        <button id="deleteScenarioBtn" class="btn">删除场景</button>
+                    </div>
+                    <div class="scenario-progress" id="scenarioProgress" style="display:none;">
+                        <div class="progress">
+                            <div class="progress-bar" id="scenarioProgressBar"></div>
+                        </div>
+                        <div class="scenario-progress-text">
+                            <span id="scenarioProgressText">0/0 事件</span>
+                            <span id="scenarioElapsed">0.0s</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <h3>导入导出</h3>
             <div class="io-panel">
                 <button id="exportBtn" class="btn">导出JSON</button>
@@ -131,6 +190,34 @@
                 </div>
                 <div id="batchFaultHint" class="batch-hint" style="display:none;">
                     批量模式：点击链路切换状态，完成后点击"应用"
+                </div>
+            </div>
+
+            <h3>压测报告</h3>
+            <div class="report-panel">
+                <div class="report-empty" id="reportEmpty">暂无报告，运行压测场景后自动生成</div>
+                <div class="report-container" id="reportContainer" style="display:none;">
+                    <div class="report-header">
+                        <div class="report-title">
+                            <span id="reportScenarioName"></span>
+                            <button id="toggleReportBtn" class="btn-small">收起</button>
+                        </div>
+                        <button id="exportReportBtn" class="btn btn-small">导出报告</button>
+                    </div>
+                    <div class="report-content" id="reportContent">
+                        <div class="report-section">
+                            <h4>总览</h4>
+                            <div class="report-stats" id="reportOverview"></div>
+                        </div>
+                        <div class="report-section">
+                            <h4>链路热力排名</h4>
+                            <div class="report-links" id="reportLinks"></div>
+                        </div>
+                        <div class="report-section">
+                            <h4>流量明细</h4>
+                            <div class="report-flows" id="reportFlows"></div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>

@@ -973,6 +973,8 @@ function updatePackets(deltaTime) {
 }
 
 function checkFlowCompletion() {
+    const newlyCompleted = [];
+    
     trafficFlows.forEach(flow => {
         if (flow.completed || !flow.path) return;
         
@@ -984,6 +986,7 @@ function checkFlowCompletion() {
             
             flow.completed = true;
             flow.endTime = Date.now();
+            newlyCompleted.push(flow);
             
             const duration = (flow.endTime - flow.startTime) / 1000;
             const lossRate = flow.totalPackets > 0 ? (flow.lostPackets / flow.totalPackets * 100).toFixed(1) : 0;
@@ -995,6 +998,8 @@ function checkFlowCompletion() {
             );
         }
     });
+    
+    newlyCompleted.forEach(flow => recordFlowCompletion(flow));
     
     const beforeCount = trafficFlows.length;
     trafficFlows = trafficFlows.filter(f => !f.completed);
@@ -1458,6 +1463,8 @@ function updateDeviceSelects() {
             select.value = currentValue;
         }
     });
+    
+    updateScenarioDeviceSelects();
 }
 
 function updatePropertyPanel() {
@@ -1863,5 +1870,599 @@ function validateTopology(data) {
     
     return errors;
 }
+
+let scenarios = [];
+let selectedScenarioId = null;
+let currentRunningScenario = null;
+let scenarioStartTime = 0;
+let scenarioElapsed = 0;
+let scenarioTimer = null;
+let scenarioSamplingTimer = null;
+let scenarioTriggeredEvents = 0;
+let scenarioFlowResults = [];
+let scenarioLinkSamples = new Map();
+let scenarioReportData = null;
+let scenarioIdCounter = 1;
+let reportCollapsed = false;
+
+const MAX_SCENARIOS = 5;
+
+function setupScenarioEvents() {
+    document.getElementById('createScenarioBtn').addEventListener('click', createScenario);
+    document.getElementById('closeScenarioEditor').addEventListener('click', closeScenarioEditor);
+    document.getElementById('addEventBtn').addEventListener('click', addEventToScenario);
+    document.getElementById('runScenarioBtn').addEventListener('click', startScenario);
+    document.getElementById('stopScenarioBtn').addEventListener('click', stopScenario);
+    document.getElementById('deleteScenarioBtn').addEventListener('click', deleteScenario);
+    document.getElementById('exportReportBtn').addEventListener('click', exportReport);
+    document.getElementById('toggleReportBtn').addEventListener('click', toggleReport);
+}
+
+function updateScenarioDeviceSelects() {
+    const selects = ['eventSrc', 'eventDst'];
+    selects.forEach(selectId => {
+        const select = document.getElementById(selectId);
+        const currentValue = select.value;
+        select.innerHTML = '<option value="">请选择</option>';
+        devices.forEach(d => {
+            const option = document.createElement('option');
+            option.value = d.id;
+            option.textContent = d.name;
+            select.appendChild(option);
+        });
+        if (currentValue && devices.find(d => d.id == currentValue)) {
+            select.value = currentValue;
+        }
+    });
+}
+
+function createScenario() {
+    const name = document.getElementById('scenarioName').value.trim();
+    if (!name) {
+        alert('请输入场景名称');
+        return;
+    }
+    if (scenarios.length >= MAX_SCENARIOS) {
+        alert(`最多只能保存 ${MAX_SCENARIOS} 个场景`);
+        return;
+    }
+    const scenario = {
+        id: scenarioIdCounter++,
+        name: name,
+        events: []
+    };
+    scenarios.push(scenario);
+    document.getElementById('scenarioName').value = '';
+    renderScenarioList();
+    openScenarioEditor(scenario.id);
+}
+
+function renderScenarioList() {
+    const list = document.getElementById('scenarioList');
+    if (scenarios.length === 0) {
+        list.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无场景，点击"新建场景"创建</p>';
+        return;
+    }
+    let html = '';
+    scenarios.forEach(s => {
+        html += `<div class="scenario-item ${s.id === selectedScenarioId ? 'active' : ''}" onclick="openScenarioEditor(${s.id})">
+            <div class="scenario-item-info">
+                <div class="scenario-item-name">${escapeHtml(s.name)}</div>
+                <div class="scenario-item-count">${s.events.length} 个事件</div>
+            </div>
+        </div>`;
+    });
+    list.innerHTML = html;
+}
+
+function openScenarioEditor(scenarioId) {
+    if (currentRunningScenario) {
+        alert('场景运行中，不允许编辑其他场景');
+        return;
+    }
+    const scenario = scenarios.find(s => s.id === scenarioId);
+    if (!scenario) return;
+    selectedScenarioId = scenarioId;
+    document.getElementById('editingScenarioName').textContent = scenario.name;
+    document.getElementById('scenarioEditor').style.display = 'block';
+    updateScenarioDeviceSelects();
+    renderEventList();
+    renderScenarioList();
+}
+
+function closeScenarioEditor() {
+    if (currentRunningScenario) return;
+    selectedScenarioId = null;
+    document.getElementById('scenarioEditor').style.display = 'none';
+    renderScenarioList();
+}
+
+function deleteScenario() {
+    if (currentRunningScenario) return;
+    if (!selectedScenarioId) return;
+    if (!confirm('确定要删除这个场景吗？')) return;
+    scenarios = scenarios.filter(s => s.id !== selectedScenarioId);
+    closeScenarioEditor();
+}
+
+function addEventToScenario() {
+    if (!selectedScenarioId) return;
+    const scenario = scenarios.find(s => s.id === selectedScenarioId);
+    if (!scenario) return;
+
+    const time = parseFloat(document.getElementById('eventTime').value);
+    const srcId = parseInt(document.getElementById('eventSrc').value);
+    const dstId = parseInt(document.getElementById('eventDst').value);
+    const dataSize = parseFloat(document.getElementById('eventDataSize').value);
+    const rate = parseFloat(document.getElementById('eventRate').value);
+
+    if (isNaN(time) || time < 0) {
+        alert('请输入有效的触发时刻');
+        return;
+    }
+    if (!srcId || !dstId) {
+        alert('请选择源设备和目的设备');
+        return;
+    }
+    if (srcId === dstId) {
+        alert('源设备和目的设备不能相同');
+        return;
+    }
+    if (!dataSize || dataSize <= 0) {
+        alert('请输入有效的数据量');
+        return;
+    }
+    if (!rate || rate <= 0) {
+        alert('请输入有效的速率');
+        return;
+    }
+
+    const event = {
+        id: Date.now(),
+        time: Math.round(time * 10) / 10,
+        srcId: srcId,
+        dstId: dstId,
+        dataSize: dataSize,
+        rate: rate,
+        triggered: false,
+        flowId: null
+    };
+    scenario.events.push(event);
+    scenario.events.sort((a, b) => a.time - b.time);
+    renderEventList();
+    renderScenarioList();
+}
+
+window.deleteEvent = function(eventId) {
+    if (!selectedScenarioId) return;
+    if (currentRunningScenario) return;
+    const scenario = scenarios.find(s => s.id === selectedScenarioId);
+    if (!scenario) return;
+    scenario.events = scenario.events.filter(e => e.id !== eventId);
+    renderEventList();
+    renderScenarioList();
+};
+
+function renderEventList() {
+    const list = document.getElementById('eventList');
+    if (!selectedScenarioId) {
+        list.innerHTML = '';
+        return;
+    }
+    const scenario = scenarios.find(s => s.id === selectedScenarioId);
+    if (!scenario || scenario.events.length === 0) {
+        list.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:8px 0;">暂无事件</p>';
+        return;
+    }
+    let html = '';
+    scenario.events.forEach((e) => {
+        const src = devices.find(d => d.id === e.srcId);
+        const dst = devices.find(d => d.id === e.dstId);
+        const isRunning = currentRunningScenario !== null;
+        html += `<div class="event-item">
+            <div class="event-item-header">
+                <span class="event-item-time">T+${e.time.toFixed(1)}s</span>
+                ${isRunning ? '' : `<span class="event-item-delete" onclick="deleteEvent(${e.id})">×</span>`}
+            </div>
+            <div class="event-item-detail">
+                ${src?.name || '-'} → ${dst?.name || '-'}<br>
+                ${e.dataSize}KB @ ${e.rate}Mbps
+            </div>
+        </div>`;
+    });
+    list.innerHTML = html;
+}
+
+function startScenario() {
+    if (currentRunningScenario) {
+        alert('已有场景正在运行');
+        return;
+    }
+    if (!selectedScenarioId) return;
+    const scenario = scenarios.find(s => s.id === selectedScenarioId);
+    if (!scenario) return;
+    if (scenario.events.length === 0) {
+        alert('场景中没有事件');
+        return;
+    }
+
+    currentRunningScenario = scenario;
+    scenarioStartTime = Date.now();
+    scenarioElapsed = 0;
+    scenarioTriggeredEvents = 0;
+    scenarioFlowResults = [];
+    scenarioLinkSamples = new Map();
+    scenarioReportData = null;
+
+    scenario.events.forEach(e => {
+        e.triggered = false;
+        e.flowId = null;
+    });
+
+    document.getElementById('runScenarioBtn').style.display = 'none';
+    document.getElementById('stopScenarioBtn').style.display = 'inline-block';
+    document.getElementById('scenarioProgress').style.display = 'block';
+    document.getElementById('deleteScenarioBtn').style.display = 'none';
+
+    updateScenarioProgress();
+
+    scenarioTimer = setInterval(scenarioTick, 50);
+    scenarioSamplingTimer = setInterval(scenarioSample, 100);
+
+    addLog(`压测场景开始: ${scenario.name}`, 'info');
+}
+
+function scenarioTick() {
+    if (!currentRunningScenario) return;
+    scenarioElapsed = (Date.now() - scenarioStartTime) / 1000;
+
+    currentRunningScenario.events.forEach(event => {
+        if (!event.triggered && scenarioElapsed >= event.time) {
+            event.triggered = true;
+            scenarioTriggeredEvents++;
+            const success = injectTraffic(event.srcId, event.dstId, event.dataSize, event.rate);
+            if (success) {
+                const flow = trafficFlows[trafficFlows.length - 1];
+                if (flow) {
+                    event.flowId = flow.id;
+                    flow.scenarioEventId = event.id;
+                }
+            } else {
+                scenarioFlowResults.push({
+                    eventId: event.id,
+                    srcId: event.srcId,
+                    dstId: event.dstId,
+                    dataSize: event.dataSize,
+                    rate: event.rate,
+                    duration: 0,
+                    lossRate: 100,
+                    path: null,
+                    failed: true,
+                    failedReason: 'unreachable'
+                });
+            }
+        }
+    });
+
+    checkScenarioCompleted();
+    updateScenarioProgress();
+}
+
+function scenarioSample() {
+    if (!currentRunningScenario) return;
+    const sampleTime = scenarioElapsed;
+    links.forEach(link => {
+        if (!scenarioLinkSamples.has(link.id)) {
+            scenarioLinkSamples.set(link.id, []);
+        }
+        const load = getLinkLoad(link.id);
+        scenarioLinkSamples.get(link.id).push({
+            time: Math.round(sampleTime * 10) / 10,
+            load: load
+        });
+    });
+}
+
+function checkScenarioCompleted() {
+    if (!currentRunningScenario) return;
+    const allTriggered = currentRunningScenario.events.every(e => e.triggered);
+    if (!allTriggered) return;
+
+    const allFlowsDone = trafficFlows.filter(f => 
+        currentRunningScenario.events.some(e => e.flowId === f.id)
+    ).length === 0;
+
+    const pendingFlowResults = currentRunningScenario.events.filter(e => 
+        e.flowId !== null && !scenarioFlowResults.some(r => r.eventId === e.id)
+    );
+    pendingFlowResults.forEach(() => {
+    });
+
+    if (allFlowsDone && pendingFlowResults.length === 0) {
+        finishScenario();
+    }
+}
+
+function finishScenario() {
+    if (!currentRunningScenario) return;
+    clearInterval(scenarioTimer);
+    clearInterval(scenarioSamplingTimer);
+    scenarioTimer = null;
+    scenarioSamplingTimer = null;
+
+    addLog(`压测场景完成: ${currentRunningScenario.name}`, 'success');
+    generateReport();
+    resetScenarioUI();
+    currentRunningScenario = null;
+}
+
+function stopScenario() {
+    if (!currentRunningScenario) return;
+    clearInterval(scenarioTimer);
+    clearInterval(scenarioSamplingTimer);
+    scenarioTimer = null;
+    scenarioSamplingTimer = null;
+
+    const activeFlowIds = new Set(
+        currentRunningScenario.events.filter(e => e.flowId !== null).map(e => e.flowId)
+    );
+    trafficFlows = trafficFlows.filter(f => !activeFlowIds.has(f.id));
+    packets = packets.filter(p => !activeFlowIds.has(p.flowId));
+    updateTrafficList();
+    updateLinkCongestion();
+
+    addLog(`压测场景中止: ${currentRunningScenario.name}`, 'warning');
+    generateReport(true);
+    resetScenarioUI();
+    currentRunningScenario = null;
+}
+
+function resetScenarioUI() {
+    document.getElementById('runScenarioBtn').style.display = 'inline-block';
+    document.getElementById('stopScenarioBtn').style.display = 'none';
+    document.getElementById('scenarioProgress').style.display = 'none';
+    document.getElementById('deleteScenarioBtn').style.display = 'inline-block';
+}
+
+function updateScenarioProgress() {
+    if (!currentRunningScenario) return;
+    const total = currentRunningScenario.events.length;
+    const triggered = scenarioTriggeredEvents;
+    const percent = total > 0 ? (triggered / total) * 100 : 0;
+    document.getElementById('scenarioProgressBar').style.width = percent + '%';
+    document.getElementById('scenarioProgressText').textContent = `${triggered}/${total} 事件`;
+    document.getElementById('scenarioElapsed').textContent = scenarioElapsed.toFixed(1) + 's';
+}
+
+function recordFlowCompletion(flow) {
+    if (!currentRunningScenario) return;
+    if (!flow.scenarioEventId) return;
+    const event = currentRunningScenario.events.find(e => e.id === flow.scenarioEventId);
+    if (!event) return;
+    if (scenarioFlowResults.some(r => r.eventId === event.id)) return;
+
+    const duration = flow.endTime && flow.startTime ? (flow.endTime - flow.startTime) / 1000 : 0;
+    const lossRate = flow.totalPackets > 0 ? (flow.lostPackets / flow.totalPackets) * 100 : 0;
+
+    scenarioFlowResults.push({
+        eventId: event.id,
+        srcId: event.srcId,
+        dstId: event.dstId,
+        dataSize: event.dataSize,
+        rate: event.rate,
+        duration: duration,
+        lossRate: lossRate,
+        path: flow.path ? getPathNodeNames(flow.path) : null,
+        failed: false,
+        failedReason: null
+    });
+}
+
+function generateReport(aborted = false) {
+    if (!currentRunningScenario) return;
+
+    const totalDuration = scenarioElapsed;
+    const totalFlows = currentRunningScenario.events.length;
+
+    const unreachableFlows = scenarioFlowResults.filter(r => r.failed && r.failedReason === 'unreachable').length;
+    const completedFlows = scenarioFlowResults.filter(r => !r.failed).length;
+    const totalLossRate = scenarioFlowResults.length > 0 
+        ? (scenarioFlowResults.reduce((sum, r) => sum + r.lossRate, 0) / scenarioFlowResults.length)
+        : 0;
+
+    const linkStats = [];
+    links.forEach(link => {
+        const samples = scenarioLinkSamples.get(link.id) || [];
+        if (samples.length === 0) return;
+        const loads = samples.map(s => s.load);
+        const peakLoad = Math.max(...loads);
+        const avgLoad = loads.reduce((a, b) => a + b, 0) / loads.length;
+        const congestedSamples = loads.filter(l => l > 1.0).length;
+        const congestedDuration = congestedSamples * 0.1;
+        linkStats.push({
+            linkId: link.id,
+            linkName: `${getDeviceName(link.from)} - ${getDeviceName(link.to)}`,
+            bandwidth: link.bandwidth,
+            peakLoad: peakLoad,
+            avgLoad: avgLoad,
+            congestedDuration: congestedDuration,
+            samples: samples
+        });
+    });
+    linkStats.sort((a, b) => b.peakLoad - a.peakLoad);
+
+    const flowDetails = [];
+    currentRunningScenario.events.forEach(event => {
+        const result = scenarioFlowResults.find(r => r.eventId === event.id);
+        if (result) {
+            flowDetails.push({
+                eventId: event.id,
+                time: event.time,
+                src: getDeviceName(result.srcId),
+                dst: getDeviceName(result.dstId),
+                rate: result.rate,
+                duration: result.duration,
+                lossRate: result.lossRate,
+                path: result.path,
+                failed: result.failed,
+                failedReason: result.failedReason
+            });
+        } else {
+            flowDetails.push({
+                eventId: event.id,
+                time: event.time,
+                src: getDeviceName(event.srcId),
+                dst: getDeviceName(event.dstId),
+                rate: event.rate,
+                duration: 0,
+                lossRate: 100,
+                path: null,
+                failed: true,
+                failedReason: 'aborted'
+            });
+        }
+    });
+    flowDetails.sort((a, b) => a.time - b.time);
+
+    scenarioReportData = {
+        scenarioName: currentRunningScenario.name,
+        aborted: aborted,
+        totalDuration: totalDuration,
+        totalFlows: totalFlows,
+        completedFlows: completedFlows,
+        unreachableFlows: unreachableFlows,
+        avgLossRate: totalLossRate,
+        linkStats: linkStats,
+        flowDetails: flowDetails,
+        rawSamples: Object.fromEntries(scenarioLinkSamples),
+        timestamp: Date.now()
+    };
+
+    renderReport();
+}
+
+function renderReport() {
+    if (!scenarioReportData) return;
+
+    document.getElementById('reportEmpty').style.display = 'none';
+    document.getElementById('reportContainer').style.display = 'block';
+    document.getElementById('reportScenarioName').textContent = scenarioReportData.scenarioName + 
+        (scenarioReportData.aborted ? ' (已中止)' : '');
+
+    const overview = document.getElementById('reportOverview');
+    overview.innerHTML = `
+        <div class="report-stat-row">
+            <span class="report-stat-label">总时长</span>
+            <span class="report-stat-value">${scenarioReportData.totalDuration.toFixed(1)}s</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">注入流量</span>
+            <span class="report-stat-value">${scenarioReportData.totalFlows}</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">完成数</span>
+            <span class="report-stat-value">${scenarioReportData.completedFlows}</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">不可达失败</span>
+            <span class="report-stat-value">${scenarioReportData.unreachableFlows}</span>
+        </div>
+        <div class="report-stat-row" style="grid-column: 1 / -1;">
+            <span class="report-stat-label">全局平均丢包率</span>
+            <span class="report-stat-value">${scenarioReportData.avgLossRate.toFixed(1)}%</span>
+        </div>
+    `;
+
+    const linksEl = document.getElementById('reportLinks');
+    if (scenarioReportData.linkStats.length === 0) {
+        linksEl.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;">无数据</p>';
+    } else {
+        let html = '';
+        scenarioReportData.linkStats.forEach(ls => {
+            const peakPercent = Math.min(100, ls.peakLoad * 100);
+            let barColor = '#52c41a';
+            if (ls.peakLoad > 0.85) barColor = '#ff4d4f';
+            else if (ls.peakLoad > 0.6) barColor = '#faad14';
+            
+            html += `<div class="report-link-item" style="display:block;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span class="report-link-name">${escapeHtml(ls.linkName)}</span>
+                    <span class="report-link-stats">
+                        <span>峰值: ${(ls.peakLoad * 100).toFixed(1)}%</span>
+                        <span>均值: ${(ls.avgLoad * 100).toFixed(1)}%</span>
+                        <span>拥塞: ${ls.congestedDuration.toFixed(1)}s</span>
+                    </span>
+                </div>
+                <div class="report-link-bar">
+                    <div class="report-link-bar-fill" style="width:${peakPercent}%;background:${barColor};"></div>
+                </div>
+            </div>`;
+        });
+        linksEl.innerHTML = html;
+    }
+
+    const flowsEl = document.getElementById('reportFlows');
+    if (scenarioReportData.flowDetails.length === 0) {
+        flowsEl.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;">无数据</p>';
+    } else {
+        let html = '';
+        scenarioReportData.flowDetails.forEach(fd => {
+            const statusClass = fd.failed ? 'failed' : 'success';
+            const statusText = fd.failed 
+                ? (fd.failedReason === 'unreachable' ? '不可达' : '已中止')
+                : '完成';
+            html += `<div class="report-flow-item">
+                <div class="report-flow-item-header">
+                    <span class="report-flow-name">T+${fd.time.toFixed(1)}s ${escapeHtml(fd.src)} → ${escapeHtml(fd.dst)}</span>
+                    <span class="report-flow-status ${statusClass}">${statusText}</span>
+                </div>
+                <div class="report-flow-detail">
+                    速率: ${fd.rate}Mbps | 耗时: ${fd.duration.toFixed(2)}s | 丢包率: ${fd.lossRate.toFixed(1)}%
+                    ${fd.path ? `<br>路径: ${escapeHtml(fd.path)}` : ''}
+                </div>
+            </div>`;
+        });
+        flowsEl.innerHTML = html;
+    }
+}
+
+function toggleReport() {
+    reportCollapsed = !reportCollapsed;
+    const container = document.getElementById('reportContainer');
+    const btn = document.getElementById('toggleReportBtn');
+    container.classList.toggle('report-collapsed', reportCollapsed);
+    btn.textContent = reportCollapsed ? '展开' : '收起';
+}
+
+function exportReport() {
+    if (!scenarioReportData) {
+        alert('没有可导出的报告');
+        return;
+    }
+    const json = JSON.stringify(scenarioReportData, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `report_${scenarioReportData.scenarioName}_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    addLog('报告已导出', 'success');
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
+
+const originalInit = init;
+init = function() {
+    originalInit();
+    setupScenarioEvents();
+    updateScenarioDeviceSelects();
+    renderScenarioList();
+};
 
 init();
