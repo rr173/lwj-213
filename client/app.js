@@ -3099,8 +3099,17 @@ function generateTopologyFromConfig(configData, layoutMode) {
                         linkCreated.add(linkKey);
 
                         const peerConfig = parsedDeviceConfigs.get(peerDevice.id);
-                        const peerIface = peerConfig?.interfaces.find(pi => pi.peerDevice === deviceConfig.name);
-                        const bandwidth = peerIface ? Math.min(iface.bandwidth, peerIface.bandwidth) : iface.bandwidth;
+                        let peerIface = peerConfig?.interfaces.find(pi => pi.peerDevice === deviceConfig.name);
+                        if (!peerIface && peerConfig && iface.ip && iface.mask) {
+                            const candidates = peerConfig.interfaces.filter(pi => pi.ip && pi.mask && isSameSubnet(iface.ip, iface.mask, pi.ip, pi.mask));
+                            if (candidates.length === 1) {
+                                peerIface = candidates[0];
+                            } else if (candidates.length > 1) {
+                                peerIface = candidates.find(pi => !pi.peerDevice) || candidates[0];
+                            }
+                        }
+                        const peerBandwidth = peerIface?.bandwidth ?? iface.bandwidth;
+                        const bandwidth = Math.min(iface.bandwidth, peerBandwidth);
 
                         const link = {
                             id: nextLinkId++,
@@ -3111,7 +3120,13 @@ function generateTopologyFromConfig(configData, layoutMode) {
                             enabled: iface.status === 'up' && (peerIface ? peerIface.status === 'up' : true),
                             interfaceInfo: {
                                 [device.id]: { name: iface.name, ip: iface.ip, mask: iface.mask, bandwidth: iface.bandwidth, status: iface.status },
-                                [peerDevice.id]: { name: peerIface?.name, ip: peerIface?.ip, mask: peerIface?.mask, bandwidth: peerIface?.bandwidth, status: peerIface?.status }
+                                [peerDevice.id]: { 
+                                    name: peerIface?.name || 'unknown', 
+                                    ip: peerIface?.ip, 
+                                    mask: peerIface?.mask, 
+                                    bandwidth: peerBandwidth, 
+                                    status: peerIface?.status || 'unknown' 
+                                }
                             }
                         };
                         newLinks.push(link);
@@ -3121,7 +3136,7 @@ function generateTopologyFromConfig(configData, layoutMode) {
         });
     });
 
-    const interfaces = Array.from(interfaceMap.values());
+    const interfaces = Array.from(interfaceMap.values()).filter(iface => !iface.peerDevice);
     for (let i = 0; i < interfaces.length; i++) {
         for (let j = i + 1; j < interfaces.length; j++) {
             const if1 = interfaces[i];
@@ -3408,7 +3423,7 @@ function checkAsymmetricBandwidth() {
                 deviceIds: [link.from, link.to],
                 linkIds: [link.id],
                 title: '非对称带宽配置',
-                description: `链路 ${fromDevice?.name || link.from} ↔ ${toDevice?.name || link.to} 两端带宽配置不一致：${fromInfo.bandwidth}Mbps vs ${toInfo.bandwidth}Mbps。这可能导致流量不均衡。`,
+                description: `链路 ${fromDevice?.name || link.from} ↔ ${toDevice?.name || link.to} 两端带宽配置不一致：${fromInfo.bandwidth ?? '未知'}Mbps vs ${toInfo.bandwidth ?? '未知'}Mbps。这可能导致流量不均衡。`,
                 timestamp: Date.now()
             });
         }
