@@ -1,5 +1,6 @@
 # 依赖目录
 node_modules/
+server/node_modules/
 
 # 系统文件
 .DS_Store
@@ -10,3 +11,12 @@ node_modules/
 
 # 提交临时文件
 .commit_msg
+
+# 数据文件
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker
+.dockerignore

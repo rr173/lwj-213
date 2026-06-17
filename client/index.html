@@ -109,6 +109,28 @@
                 </div>
             </div>
 
+            <h3>拓扑存档</h3>
+            <div class="topology-archive-panel">
+                <div class="form-group">
+                    <label>版本名称</label>
+                    <input type="text" id="topoVersionName" placeholder="可选，留空自动命名">
+                </div>
+                <div class="io-panel">
+                    <button id="saveTopoBtn" class="btn btn-primary">保存拓扑</button>
+                    <button id="refreshVersionsBtn" class="btn">刷新</button>
+                </div>
+                <div class="form-group" style="margin-top: 10px;">
+                    <label>历史版本</label>
+                    <select id="topoVersionSelect">
+                        <option value="">选择版本加载</option>
+                    </select>
+                </div>
+                <div class="version-info" id="versionInfo" style="display:none;">
+                    <div class="version-meta" id="versionMeta"></div>
+                    <button id="loadVersionBtn" class="btn btn-small">加载此版本</button>
+                </div>
+            </div>
+
             <h3>导入导出</h3>
             <div class="io-panel">
                 <button id="exportBtn" class="btn">导出JSON</button>
@@ -195,28 +217,78 @@
 
             <h3>压测报告</h3>
             <div class="report-panel">
-                <div class="report-empty" id="reportEmpty">暂无报告，运行压测场景后自动生成</div>
-                <div class="report-container" id="reportContainer" style="display:none;">
-                    <div class="report-header">
-                        <div class="report-title">
-                            <span id="reportScenarioName"></span>
-                            <button id="toggleReportBtn" class="btn-small">收起</button>
+                <div class="report-tabs">
+                    <button class="report-tab active" data-tab="current">当前报告</button>
+                    <button class="report-tab" data-tab="history">历史报告</button>
+                    <button class="report-tab" data-tab="compare">对比分析</button>
+                </div>
+
+                <div class="report-tab-content" id="tab-current">
+                    <div class="report-empty" id="reportEmpty">暂无报告，运行压测场景后自动生成</div>
+                    <div class="report-container" id="reportContainer" style="display:none;">
+                        <div class="report-header">
+                            <div class="report-title">
+                                <span id="reportScenarioName"></span>
+                                <button id="toggleReportBtn" class="btn-small">收起</button>
+                            </div>
+                            <button id="exportReportBtn" class="btn btn-small">导出报告</button>
                         </div>
-                        <button id="exportReportBtn" class="btn btn-small">导出报告</button>
+                        <div class="report-content" id="reportContent">
+                            <div class="report-section">
+                                <h4>总览</h4>
+                                <div class="report-stats" id="reportOverview"></div>
+                            </div>
+                            <div class="report-section">
+                                <h4>链路热力排名</h4>
+                                <div class="report-links" id="reportLinks"></div>
+                            </div>
+                            <div class="report-section">
+                                <h4>流量明细</h4>
+                                <div class="report-flows" id="reportFlows"></div>
+                            </div>
+                        </div>
                     </div>
-                    <div class="report-content" id="reportContent">
-                        <div class="report-section">
-                            <h4>总览</h4>
-                            <div class="report-stats" id="reportOverview"></div>
+                </div>
+
+                <div class="report-tab-content" id="tab-history" style="display:none;">
+                    <div class="history-header">
+                        <button id="refreshHistoryBtn" class="btn btn-small">刷新列表</button>
+                    </div>
+                    <div class="history-list" id="historyList">
+                        <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">加载中...</p>
+                    </div>
+                </div>
+
+                <div class="report-tab-content" id="tab-compare" style="display:none;">
+                    <div class="compare-selectors">
+                        <div class="form-group">
+                            <label>报告 A</label>
+                            <select id="compareReport1">
+                                <option value="">选择报告</option>
+                            </select>
                         </div>
-                        <div class="report-section">
-                            <h4>链路热力排名</h4>
-                            <div class="report-links" id="reportLinks"></div>
+                        <div class="form-group">
+                            <label>报告 B</label>
+                            <select id="compareReport2">
+                                <option value="">选择报告</option>
+                            </select>
                         </div>
-                        <div class="report-section">
-                            <h4>流量明细</h4>
-                            <div class="report-flows" id="reportFlows"></div>
+                        <button id="doCompareBtn" class="btn btn-primary">开始对比</button>
+                    </div>
+                    <div class="compare-results" id="compareResults" style="display:none;">
+                        <div class="compare-overview">
+                            <h4>对比总览</h4>
+                            <div class="report-stats" id="compareOverviewStats"></div>
                         </div>
+                        <div class="compare-links-section">
+                            <h4>链路对比</h4>
+                            <div class="compare-links-table" id="compareLinksTable"></div>
+                        </div>
+                    </div>
+                    <div class="compare-empty" id="compareEmpty" style="display:none;">
+                        <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">
+                            选择两份报告进行对比
+                        </p>
                     </div>
                 </div>
             </div>

@@ -2501,12 +2501,388 @@ function escapeHtml(str) {
     return div.innerHTML;
 }
 
-const originalInit = init;
+const API_BASE = '/api';
+
+let topologyVersions = [];
+let historyReports = [];
+let currentViewedReport = null;
+let compareResult = null;
+
+async function apiRequest(url, options = {}) {
+    try {
+        const response = await fetch(API_BASE + url, {
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            ...options
+        });
+        const data = await response.json();
+        return data;
+    } catch (err) {
+        console.error('API请求失败:', err);
+        return { success: false, error: err.message };
+    }
+}
+
+function setupBackendEvents() {
+    document.getElementById('saveTopoBtn').addEventListener('click', saveTopology);
+    document.getElementById('refreshVersionsBtn').addEventListener('click', loadTopologyVersions);
+    document.getElementById('topoVersionSelect').addEventListener('change', onVersionSelectChange);
+    document.getElementById('loadVersionBtn').addEventListener('click', loadSelectedVersion);
+
+    document.querySelectorAll('.report-tab').forEach(tab => {
+        tab.addEventListener('click', (e) => {
+            const tabName = e.target.dataset.tab;
+            switchReportTab(tabName);
+        });
+    });
+
+    document.getElementById('refreshHistoryBtn').addEventListener('click', loadHistoryReports);
+    document.getElementById('doCompareBtn').addEventListener('click', doCompareReports);
+}
+
+function switchReportTab(tabName) {
+    document.querySelectorAll('.report-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.tab === tabName);
+    });
+
+    document.querySelectorAll('.report-tab-content').forEach(content => {
+        content.style.display = 'none';
+    });
+
+    document.getElementById('tab-' + tabName).style.display = 'block';
+
+    if (tabName === 'history') {
+        loadHistoryReports();
+    } else if (tabName === 'compare') {
+        loadCompareReportOptions();
+    }
+}
+
+async function saveTopology() {
+    const name = document.getElementById('topoVersionName').value.trim() || null;
+
+    const result = await apiRequest('/topology', {
+        method: 'POST',
+        body: JSON.stringify({
+            devices: devices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
+            links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled })),
+            manualRoutes: manualRoutes,
+            name: name
+        })
+    });
+
+    if (result.success) {
+        addLog(`拓扑已保存，版本号: ${result.data.version}`, 'success');
+        document.getElementById('topoVersionName').value = '';
+        loadTopologyVersions();
+    } else {
+        alert('保存失败: ' + (result.error || '未知错误'));
+    }
+}
+
+async function loadTopologyVersions() {
+    const result = await apiRequest('/topology/versions');
+    if (result.success) {
+        topologyVersions = result.data;
+        renderVersionSelect();
+    }
+}
+
+function renderVersionSelect() {
+    const select = document.getElementById('topoVersionSelect');
+    select.innerHTML = '<option value="">选择版本加载</option>';
+
+    topologyVersions.forEach(v => {
+        const option = document.createElement('option');
+        option.value = v.id;
+        const date = new Date(v.createdAt).toLocaleString();
+        option.textContent = `v${v.version} - ${v.name} (${date})`;
+        select.appendChild(option);
+    });
+
+    document.getElementById('versionInfo').style.display = 'none';
+}
+
+function onVersionSelectChange() {
+    const versionId = parseInt(document.getElementById('topoVersionSelect').value);
+    const versionInfo = document.getElementById('versionInfo');
+
+    if (!versionId) {
+        versionInfo.style.display = 'none';
+        return;
+    }
+
+    const version = topologyVersions.find(v => v.id === versionId);
+    if (version) {
+        const date = new Date(version.createdAt).toLocaleString();
+        document.getElementById('versionMeta').innerHTML = `
+            <div style="font-size:12px;color:#666;margin-bottom:6px;">
+                版本号: v${version.version}<br>
+                创建时间: ${date}
+            </div>
+        `;
+        versionInfo.style.display = 'block';
+    }
+}
+
+async function loadSelectedVersion() {
+    const versionId = parseInt(document.getElementById('topoVersionSelect').value);
+    if (!versionId) return;
+
+    if (!confirm('加载此版本将覆盖当前拓扑，确定继续？')) return;
+
+    const result = await apiRequest('/topology/' + versionId);
+    if (result.success) {
+        applyTopologyData(result.data);
+        addLog(`已加载拓扑版本 v${result.data.version}`, 'success');
+    } else {
+        alert('加载失败: ' + (result.error || '未知错误'));
+    }
+}
+
+function applyTopologyData(data) {
+    devices = data.devices.map(d => ({ ...d }));
+    links = data.links.map(l => ({ ...l, enabled: l.enabled !== undefined ? l.enabled : true }));
+    manualRoutes = data.manualRoutes || [];
+
+    deviceIdCounter = Math.max(...devices.map(d => d.id), 0) + 1;
+    linkIdCounter = Math.max(...links.map(l => l.id), 0) + 1;
+
+    trafficFlows = [];
+    packets = [];
+    congestionStates.clear();
+
+    faultStats = {
+        disabledLinkCount: links.filter(l => !l.enabled).length,
+        totalFaultCount: 0,
+        pathSwitchCount: 0,
+        pausedFlowCount: 0
+    };
+
+    selectedDevice = null;
+    selectedLink = null;
+
+    updateDeviceCount();
+    updateDeviceSelects();
+    updatePropertyPanel();
+    recalculateRoutes();
+    updateTrafficList();
+    updateFaultStats();
+}
+
+async function saveReportToBackend(reportData) {
+    const topologySnapshot = {
+        devices: devices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
+        links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled })),
+        manualRoutes: manualRoutes
+    };
+
+    const fullReport = {
+        ...reportData,
+        topologySnapshot
+    };
+
+    const result = await apiRequest('/reports', {
+        method: 'POST',
+        body: JSON.stringify(fullReport)
+    });
+
+    if (result.success) {
+        addLog(`报告已保存到后端，ID: ${result.data.id}`, 'success');
+        return result.data;
+    } else {
+        addLog('保存报告到后端失败', 'error');
+        return null;
+    }
+}
+
+async function loadHistoryReports() {
+    const result = await apiRequest('/reports');
+    if (result.success) {
+        historyReports = result.data;
+        renderHistoryList();
+    } else {
+        document.getElementById('historyList').innerHTML = 
+            '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">加载失败</p>';
+    }
+}
+
+function renderHistoryList() {
+    const list = document.getElementById('historyList');
+
+    if (historyReports.length === 0) {
+        list.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">暂无历史报告</p>';
+        return;
+    }
+
+    let html = '';
+    historyReports.forEach(report => {
+        const date = new Date(report.timestamp).toLocaleString();
+        const statusClass = report.aborted ? 'aborted' : 'completed';
+        const statusText = report.aborted ? '已中止' : '已完成';
+
+        html += `
+            <div class="history-item" onclick="viewHistoryReport(${report.id})">
+                <div class="history-item-header">
+                    <span class="history-item-name">${escapeHtml(report.scenarioName)}</span>
+                    <span class="history-item-status status-${statusClass}">${statusText}</span>
+                </div>
+                <div class="history-item-meta">
+                    <span>${date}</span>
+                    <span>时长: ${report.totalDuration.toFixed(1)}s</span>
+                    <span>流量: ${report.totalFlows}条</span>
+                </div>
+            </div>
+        `;
+    });
+
+    list.innerHTML = html;
+}
+
+window.viewHistoryReport = async function(reportId) {
+    const result = await apiRequest('/reports/' + reportId);
+    if (result.success) {
+        currentViewedReport = result.data;
+        displayHistoryReport(result.data);
+    }
+};
+
+function displayHistoryReport(report) {
+    switchReportTab('current');
+
+    scenarioReportData = report;
+    renderReport();
+
+    document.getElementById('reportScenarioName').textContent = 
+        report.scenarioName + (report.aborted ? ' (历史-已中止)' : ' (历史)');
+}
+
+async function loadCompareReportOptions() {
+    await loadHistoryReports();
+
+    const select1 = document.getElementById('compareReport1');
+    const select2 = document.getElementById('compareReport2');
+
+    select1.innerHTML = '<option value="">选择报告 A</option>';
+    select2.innerHTML = '<option value="">选择报告 B</option>';
+
+    historyReports.forEach(report => {
+        const date = new Date(report.timestamp).toLocaleString();
+        const label = `${report.scenarioName} - ${date}`;
+
+        const opt1 = document.createElement('option');
+        opt1.value = report.id;
+        opt1.textContent = label;
+        select1.appendChild(opt1);
+
+        const opt2 = document.createElement('option');
+        opt2.value = report.id;
+        opt2.textContent = label;
+        select2.appendChild(opt2);
+    });
+
+    document.getElementById('compareResults').style.display = 'none';
+    document.getElementById('compareEmpty').style.display = 'block';
+}
+
+async function doCompareReports() {
+    const id1 = parseInt(document.getElementById('compareReport1').value);
+    const id2 = parseInt(document.getElementById('compareReport2').value);
+
+    if (!id1 || !id2) {
+        alert('请选择两份报告');
+        return;
+    }
+
+    if (id1 === id2) {
+        alert('请选择不同的报告进行对比');
+        return;
+    }
+
+    const result = await apiRequest(`/reports/compare/${id1}/${id2}`);
+    if (result.success) {
+        compareResult = result.data;
+        renderCompareResults();
+    } else {
+        alert('对比失败: ' + (result.error || '未知错误'));
+    }
+}
+
+function renderCompareResults() {
+    if (!compareResult) return;
+
+    document.getElementById('compareEmpty').style.display = 'none';
+    document.getElementById('compareResults').style.display = 'block';
+
+    const overview = document.getElementById('compareOverviewStats');
+    const { report1, report2, overview: overviewDiff } = compareResult;
+
+    overview.innerHTML = `
+        <div class="report-stat-row">
+            <span class="report-stat-label">报告A</span>
+            <span class="report-stat-value">${escapeHtml(report1.scenarioName)}</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">报告B</span>
+            <span class="report-stat-value">${escapeHtml(report2.scenarioName)}</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">时长差</span>
+            <span class="report-stat-value">${overviewDiff.durationDiff > 0 ? '+' : ''}${overviewDiff.durationDiff.toFixed(1)}s</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">丢包率差</span>
+            <span class="report-stat-value" style="color: ${overviewDiff.lossRateDiff > 0 ? '#ff4d4f' : (overviewDiff.lossRateDiff < 0 ? '#52c41a' : '#333')};">
+                ${overviewDiff.lossRateDiff > 0 ? '+' : ''}${overviewDiff.lossRateDiff.toFixed(2)}%
+            </span>
+        </div>
+    `;
+
+    const linksTable = document.getElementById('compareLinksTable');
+    let html = '<div class="compare-table-header">';
+    html += '<span>链路名称</span>';
+    html += '<span>峰值负载 (A→B)</span>';
+    html += '<span>丢包率差</span>';
+    html += '</div>';
+
+    compareResult.links.forEach(link => {
+        const peakA = (link.report1.peakLoad * 100).toFixed(1);
+        const peakB = (link.report2.peakLoad * 100).toFixed(1);
+        const peakDiff = link.peakLoadDiff * 100;
+        const peakDiffPercent = link.peakLoadDiffPercent.toFixed(1);
+
+        const peakColor = peakDiff > 0 ? '#ff4d4f' : (peakDiff < 0 ? '#52c41a' : '#333');
+        const lossColor = link.lossRateDiff > 0 ? '#ff4d4f' : (link.lossRateDiff < 0 ? '#52c41a' : '#333');
+
+        html += `<div class="compare-table-row">
+            <span class="compare-link-name">${escapeHtml(link.linkName)}</span>
+            <span style="color: ${peakColor};">
+                ${peakA}% → ${peakB}%
+                <span style="font-size:10px;">(${peakDiff > 0 ? '+' : ''}${peakDiffPercent}%)</span>
+            </span>
+            <span style="color: ${lossColor};">
+                ${link.lossRateDiff > 0 ? '+' : ''}${link.lossRateDiff.toFixed(2)}%
+            </span>
+        </div>`;
+    });
+
+    linksTable.innerHTML = html;
+}
+
+const originalGenerateReport = generateReport;
+generateReport = function(aborted = false) {
+    originalGenerateReport(aborted);
+    if (scenarioReportData) {
+        saveReportToBackend(scenarioReportData);
+    }
+};
+
+const originalInit2 = init;
 init = function() {
-    originalInit();
-    setupScenarioEvents();
-    updateScenarioDeviceSelects();
-    renderScenarioList();
+    originalInit2();
+    setupBackendEvents();
+    loadTopologyVersions();
 };
 
 init();
