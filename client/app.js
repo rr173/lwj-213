@@ -1048,6 +1048,10 @@ function updateRoutingTables() {
 }
 
 function injectTraffic(srcId, dstId, dataSizeKB, rateMbps, priority) {
+    if (isPlayback) {
+        addLog('回放模式下无法注入新流量', 'warning');
+        return false;
+    }
     if (trafficFlows.length >= MAX_TRAFFIC_FLOWS) {
         addLog('活跃流量已达上限（10条）', 'error');
         return false;
@@ -1693,6 +1697,10 @@ function setupUIEvents() {
     });
     
     document.getElementById('injectBtn').addEventListener('click', () => {
+        if (isPlayback) {
+            addLog('回放模式下无法注入新流量', 'warning');
+            return;
+        }
         const srcId = parseInt(document.getElementById('srcDevice').value);
         const dstId = parseInt(document.getElementById('dstDevice').value);
         const dataSize = parseFloat(document.getElementById('dataSize').value);
@@ -4945,6 +4953,14 @@ function stopRecording() {
     document.getElementById('stopRecordingBtn').style.display = 'none';
     document.getElementById('recordingStatus').style.display = 'none';
 
+    if (duration < 0.3 || sampleCount === 0) {
+        addLog(`录制时间过短（${duration.toFixed(1)}s），已丢弃`, 'warning');
+        recordingLinkSamples = {};
+        recordingEvents = [];
+        document.getElementById('recordingName').value = '';
+        return;
+    }
+
     const name = document.getElementById('recordingName').value.trim() || null;
     document.getElementById('recordingName').value = '';
 
@@ -5043,6 +5059,17 @@ window.playRecording = async function(recordingId) {
     }
 
     playbackData = result.data;
+
+    if (!playbackData.duration || playbackData.duration <= 0) {
+        alert('录制时长无效，无法回放');
+        return;
+    }
+
+    if (!playbackData.linkSamples || Object.keys(playbackData.linkSamples).length === 0) {
+        alert('该录制没有链路采样数据，无法回放');
+        return;
+    }
+
     isPlayback = true;
     playbackPaused = false;
     playbackCurrentTime = 0;
@@ -5058,6 +5085,7 @@ window.playRecording = async function(recordingId) {
     document.getElementById('injectBtn').style.opacity = '0.5';
 
     renderEventTimeline();
+    applyPlaybackFrame();
     startPlaybackTimer();
     addLog(`开始回放: ${playbackData.name}`, 'info');
 };
@@ -5085,6 +5113,8 @@ function startPlaybackTimer() {
             updatePlaybackUI();
             applyPlaybackFrame();
             addLog('回放结束', 'info');
+            clearInterval(playbackTimer);
+            playbackTimer = null;
             return;
         }
 
@@ -5094,8 +5124,9 @@ function startPlaybackTimer() {
 }
 
 function updatePlaybackUI() {
-    if (!playbackData) return;
-    const pct = (playbackCurrentTime / playbackData.duration) * 100;
+    if (!playbackData || !playbackData.duration || playbackData.duration <= 0) return;
+    const pct = Math.min(100, Math.max(0, (playbackCurrentTime / playbackData.duration) * 100));
+    if (isNaN(pct) || !isFinite(pct)) return;
     document.getElementById('playbackProgressBar').style.width = pct + '%';
     document.getElementById('playbackSeekBar').value = pct;
     document.getElementById('playbackCurrentTime').textContent = playbackCurrentTime.toFixed(1) + 's';
@@ -5105,6 +5136,8 @@ function applyPlaybackFrame() {
     if (!playbackData) return;
     playbackLinkLoads.clear();
     playbackCongestion.clear();
+
+    if (!playbackData.linkSamples) return;
 
     Object.keys(playbackData.linkSamples).forEach(linkKey => {
         const samples = playbackData.linkSamples[linkKey];
@@ -5120,13 +5153,15 @@ function applyPlaybackFrame() {
         }
 
         const [fromId, toId] = linkKey.split('-').map(Number);
+        if (isNaN(fromId) || isNaN(toId)) return;
         const link = links.find(l =>
             (l.from === fromId && l.to === toId) ||
             (l.from === toId && l.to === fromId)
         );
-        if (link) {
-            playbackLinkLoads.set(link.id, closest.load);
-            if (closest.load > 0.85) {
+        if (link && closest) {
+            const load = isNaN(closest.load) ? 0 : closest.load;
+            playbackLinkLoads.set(link.id, load);
+            if (load > 0.85) {
                 playbackCongestion.add(link.id);
             }
         }
@@ -5140,8 +5175,9 @@ function togglePlaybackPause() {
 }
 
 function seekPlayback(time) {
-    if (!playbackData) return;
+    if (!playbackData || !playbackData.duration || playbackData.duration <= 0) return;
     playbackCurrentTime = Math.max(0, Math.min(playbackData.duration, time));
+    if (isNaN(playbackCurrentTime)) playbackCurrentTime = 0;
     updatePlaybackUI();
     applyPlaybackFrame();
 }
