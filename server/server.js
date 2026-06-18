@@ -19,7 +19,12 @@ const {
   getAuditReport,
   compareAuditReports,
   savePartitionChange,
-  listPartitionChanges
+  listPartitionChanges,
+  saveTrafficRecording,
+  listTrafficRecordings,
+  getTrafficRecording,
+  deleteTrafficRecording,
+  compareTrafficRecordings
 } = require('./database');
 
 const app = express();
@@ -346,6 +351,103 @@ app.get('/api/partitions/changes', async (req, res) => {
   } catch (err) {
     console.error('获取分区变更历史失败:', err);
     res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.post('/api/recordings', async (req, res) => {
+  try {
+    const recordingData = req.body;
+
+    if (!recordingData.linkSamples || !recordingData.events) {
+      return res.status(400).json({ error: '缺少必要字段: linkSamples, events' });
+    }
+
+    const result = await saveTrafficRecording(recordingData);
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存流量录制失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/recordings', async (req, res) => {
+  try {
+    const recordings = await listTrafficRecordings();
+    res.json({
+      success: true,
+      data: recordings
+    });
+  } catch (err) {
+    console.error('获取录制列表失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.get('/api/recordings/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的录制ID' });
+    }
+
+    const recording = await getTrafficRecording(id);
+    if (!recording) {
+      return res.status(404).json({ error: '录制不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: recording
+    });
+  } catch (err) {
+    console.error('获取流量录制失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.delete('/api/recordings/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的录制ID' });
+    }
+
+    await deleteTrafficRecording(id);
+
+    res.json({
+      success: true
+    });
+  } catch (err) {
+    console.error('删除流量录制失败:', err);
+    res.status(500).json({ error: '删除失败' });
+  }
+});
+
+app.get('/api/recordings/compare/:id1/:id2', async (req, res) => {
+  try {
+    const id1 = parseInt(req.params.id1);
+    const id2 = parseInt(req.params.id2);
+
+    if (isNaN(id1) || isNaN(id2)) {
+      return res.status(400).json({ error: '无效的录制ID' });
+    }
+
+    const result = await compareTrafficRecordings(id1, id2);
+    if (!result) {
+      return res.status(404).json({ error: '录制不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('对比流量录制失败:', err);
+    res.status(500).json({ error: '对比失败' });
   }
 });
 

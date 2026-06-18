@@ -232,11 +232,13 @@ function setupCanvasEvents() {
             if (device) {
                 selectedDevice = device;
                 selectedLink = null;
-                draggedDevice = device;
-                dragOffset = {
-                    x: worldPos.x - device.x,
-                    y: worldPos.y - device.y
-                };
+                if (!isPlayback) {
+                    draggedDevice = device;
+                    dragOffset = {
+                        x: worldPos.x - device.x,
+                        y: worldPos.y - device.y
+                    };
+                }
                 updatePropertyPanel();
             } else if (link) {
                 selectedLink = link;
@@ -264,13 +266,13 @@ function setupCanvasEvents() {
             offset.y = e.clientY - panStart.y;
         }
         
-        if (draggedDevice) {
+        if (draggedDevice && !isPlayback) {
             draggedDevice.x = worldPos.x - dragOffset.x;
             draggedDevice.y = worldPos.y - dragOffset.y;
             updateRoutingTables();
         }
         
-        if (isLinking) {
+        if (isLinking && !isPlayback) {
             mousePos = worldPos;
         }
     });
@@ -285,7 +287,7 @@ function setupCanvasEvents() {
             recalculateRoutes();
         }
         
-        if (isLinking) {
+        if (isLinking && !isPlayback) {
             const rect = canvas.getBoundingClientRect();
             const x = e.clientX - rect.left;
             const y = e.clientY - rect.top;
@@ -298,6 +300,9 @@ function setupCanvasEvents() {
                 }
             }
             
+            isLinking = false;
+            linkStartDevice = null;
+        } else if (isLinking && isPlayback) {
             isLinking = false;
             linkStartDevice = null;
         }
@@ -327,6 +332,7 @@ function setupCanvasEvents() {
     });
 
     canvas.addEventListener('dblclick', (e) => {
+        if (isPlayback) return;
         const rect = canvas.getBoundingClientRect();
         const x = e.clientX - rect.left;
         const y = e.clientY - rect.top;
@@ -369,6 +375,11 @@ function setupDeviceDrag() {
         e.preventDefault();
         canvas.classList.remove('dragging-device');
         
+        if (isPlayback) {
+            addLog('回放模式下无法修改拓扑', 'warning');
+            return;
+        }
+        
         const deviceType = e.dataTransfer.getData('deviceType');
         if (!deviceType) return;
         
@@ -387,6 +398,10 @@ function setupDeviceDrag() {
 }
 
 function addDevice(type, x, y) {
+    if (isPlayback) {
+        addLog('回放模式下无法修改拓扑', 'warning');
+        return null;
+    }
     const typeNames = {
         router: '路由器',
         switch: '交换机',
@@ -411,6 +426,10 @@ function addDevice(type, x, y) {
 }
 
 function deleteDevice(deviceId) {
+    if (isPlayback) {
+        addLog('回放模式下无法修改拓扑', 'warning');
+        return;
+    }
     const deviceIndex = devices.findIndex(d => d.id === deviceId);
     if (deviceIndex === -1) return;
     
@@ -506,6 +525,10 @@ function hasLinkBetween(fromId, toId) {
 }
 
 function addLink(fromId, toId, bandwidth, delay, reservationRatio) {
+    if (isPlayback) {
+        addLog('回放模式下无法修改拓扑', 'warning');
+        return null;
+    }
     const link = {
         id: linkIdCounter++,
         from: fromId,
@@ -524,6 +547,10 @@ function addLink(fromId, toId, bandwidth, delay, reservationRatio) {
 }
 
 function deleteLink(linkId) {
+    if (isPlayback) {
+        addLog('回放模式下无法修改拓扑', 'warning');
+        return;
+    }
     const link = links.find(l => l.id === linkId);
     if (link && !link.enabled) {
         faultStats.disabledLinkCount--;
@@ -542,6 +569,10 @@ function deleteLink(linkId) {
 }
 
 function toggleLinkEnabled(linkId) {
+    if (isPlayback) {
+        addLog('回放模式下无法修改拓扑', 'warning');
+        return;
+    }
     const link = links.find(l => l.id === linkId);
     if (!link) return;
     
@@ -4722,12 +4753,684 @@ function renderAuditCompareResults(compareData) {
     resultsEl.innerHTML = html;
 }
 
+let isRecording = false;
+let recordingStartTime = 0;
+let recordingSamplingTimer = null;
+let recordingLinkSamples = {};
+let recordingEvents = [];
+let recordingPrevCongestion = new Set();
+let trafficRecordings = [];
+let currentCompareRecordingData = null;
+
+let isPlayback = false;
+let playbackData = null;
+let playbackPaused = false;
+let playbackCurrentTime = 0;
+let playbackTimer = null;
+let playbackLinkLoads = new Map();
+let playbackCongestion = new Set();
+
+const RECORDING_SAMPLE_INTERVAL = 200;
+
+function setupTrafficRecordingEvents() {
+    document.getElementById('startRecordingBtn').addEventListener('click', startRecording);
+    document.getElementById('stopRecordingBtn').addEventListener('click', stopRecording);
+    document.getElementById('refreshRecordingsBtn').addEventListener('click', loadTrafficRecordings);
+
+    document.getElementById('playbackPauseBtn').addEventListener('click', togglePlaybackPause);
+    document.getElementById('playbackExitBtn').addEventListener('click', exitPlayback);
+    document.getElementById('playbackSeekBar').addEventListener('input', (e) => {
+        if (!playbackData) return;
+        const pct = parseFloat(e.target.value);
+        const targetTime = (pct / 100) * playbackData.duration;
+        seekPlayback(targetTime);
+    });
+
+    document.getElementById('doCompareRecordingsBtn').addEventListener('click', doCompareRecordings);
+}
+
+function buildLinkKey(fromId, toId) {
+    return `${fromId}-${toId}`;
+}
+
+function getActiveFlowCount() {
+    return trafficFlows.filter(f => !f.completed && !f.paused).length;
+}
+
+function startRecording() {
+    if (isRecording || isPlayback) return;
+
+    isRecording = true;
+    recordingStartTime = Date.now();
+    recordingLinkSamples = {};
+    recordingEvents = [];
+    recordingPrevCongestion = new Set(congestionStates.keys());
+
+    links.forEach(link => {
+        const key = buildLinkKey(link.from, link.to);
+        recordingLinkSamples[key] = [];
+    });
+
+    document.getElementById('startRecordingBtn').style.display = 'none';
+    document.getElementById('stopRecordingBtn').style.display = 'inline-block';
+    document.getElementById('recordingStatus').style.display = 'flex';
+    updateRecordingTime();
+
+    recordingSamplingTimer = setInterval(recordingSample, RECORDING_SAMPLE_INTERVAL);
+    addLog('开始录制流量', 'info');
+}
+
+function updateRecordingTime() {
+    if (!isRecording) return;
+    const elapsed = (Date.now() - recordingStartTime) / 1000;
+    document.getElementById('recordingTime').textContent = elapsed.toFixed(1) + 's';
+    requestAnimationFrame(updateRecordingTime);
+}
+
+function recordingSample() {
+    if (!isRecording) return;
+    const elapsed = (Date.now() - recordingStartTime) / 1000;
+    const activeFlows = getActiveFlowCount();
+
+    links.forEach(link => {
+        const key = buildLinkKey(link.from, link.to);
+        if (!recordingLinkSamples[key]) {
+            recordingLinkSamples[key] = [];
+        }
+        const load = getLinkLoad(link.id);
+        recordingLinkSamples[key].push({
+            time: Math.round(elapsed * 10) / 10,
+            load: load,
+            activeFlows: activeFlows
+        });
+    });
+
+    const currentCongested = new Set(congestionStates.keys());
+    currentCongested.forEach(linkId => {
+        if (!recordingPrevCongestion.has(linkId)) {
+            recordTrafficEvent('congestion-start', elapsed, linkId);
+        }
+    });
+    recordingPrevCongestion.forEach(linkId => {
+        if (!currentCongested.has(linkId)) {
+            recordTrafficEvent('congestion-end', elapsed, linkId);
+        }
+    });
+    recordingPrevCongestion = currentCongested;
+}
+
+function recordTrafficEvent(type, time, linkId = null, flowId = null, extra = {}) {
+    if (!isRecording) return;
+
+    const event = {
+        type,
+        time: Math.round(time * 10) / 10,
+        linkId,
+        flowId,
+        ...extra
+    };
+
+    if (linkId) {
+        const link = links.find(l => l.id === linkId);
+        if (link) {
+            event.linkName = `${getDeviceName(link.from)} - ${getDeviceName(link.to)}`;
+        }
+    }
+
+    if (flowId) {
+        const flow = trafficFlows.find(f => f.id === flowId);
+        if (flow) {
+            event.flowSrc = getDeviceName(flow.srcId);
+            event.flowDst = getDeviceName(flow.dstId);
+        }
+    }
+
+    recordingEvents.push(event);
+}
+
+const originalInjectTraffic = injectTraffic;
+injectTraffic = function(srcId, dstId, dataSizeKB, rateMbps, priority) {
+    const result = originalInjectTraffic(srcId, dstId, dataSizeKB, rateMbps, priority);
+    if (result && isRecording) {
+        const elapsed = (Date.now() - recordingStartTime) / 1000;
+        const flow = trafficFlows[trafficFlows.length - 1];
+        if (flow) {
+            recordTrafficEvent('inject', elapsed, null, flow.id, {
+                dataSizeKB, rateMbps, priority
+            });
+        }
+    }
+    return result;
+};
+
+const originalCheckFlowCompletion = checkFlowCompletion;
+checkFlowCompletion = function() {
+    const before = trafficFlows.filter(f => !f.completed).map(f => f.id);
+    originalCheckFlowCompletion();
+    const after = trafficFlows.filter(f => !f.completed).map(f => f.id);
+    const completed = before.filter(id => !after.includes(id));
+
+    if (isRecording && completed.length > 0) {
+        const elapsed = (Date.now() - recordingStartTime) / 1000;
+        completed.forEach(flowId => {
+            recordTrafficEvent('complete', elapsed, null, flowId);
+        });
+    }
+};
+
+const originalCreatePacket = createPacket;
+createPacket = function(flow) {
+    const beforeLost = flow.lostPackets;
+    originalCreatePacket(flow);
+    if (isRecording && flow.lostPackets > beforeLost) {
+        const elapsed = (Date.now() - recordingStartTime) / 1000;
+        if (flow.path && flow.path.segments && flow.path.segments.length > 0) {
+            const linkId = flow.path.segments[0].link.id;
+            recordTrafficEvent('loss', elapsed, linkId, flow.id);
+        }
+    }
+};
+
+function stopRecording() {
+    if (!isRecording) return;
+
+    isRecording = false;
+    clearInterval(recordingSamplingTimer);
+    recordingSamplingTimer = null;
+
+    const duration = (Date.now() - recordingStartTime) / 1000;
+    const sampleCount = Object.values(recordingLinkSamples).reduce((sum, arr) => sum + arr.length, 0);
+
+    document.getElementById('startRecordingBtn').style.display = 'inline-block';
+    document.getElementById('stopRecordingBtn').style.display = 'none';
+    document.getElementById('recordingStatus').style.display = 'none';
+
+    const name = document.getElementById('recordingName').value.trim() || null;
+    document.getElementById('recordingName').value = '';
+
+    const topologySnapshot = {
+        devices: devices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
+        links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled, reservationRatio: l.reservationRatio || 0 })),
+        manualRoutes: manualRoutes
+    };
+
+    const recordingData = {
+        name,
+        duration,
+        sampleCount,
+        eventCount: recordingEvents.length,
+        linkSamples: recordingLinkSamples,
+        events: recordingEvents,
+        topologySnapshot
+    };
+
+    saveRecordingToBackend(recordingData);
+
+    addLog(`录制完成，时长 ${duration.toFixed(1)}s，${sampleCount} 个采样点，${recordingEvents.length} 个事件`, 'success');
+}
+
+async function saveRecordingToBackend(recordingData) {
+    const result = await apiRequest('/recordings', {
+        method: 'POST',
+        body: JSON.stringify(recordingData)
+    });
+
+    if (result.success) {
+        addLog(`录制已保存，ID: ${result.data.id}`, 'success');
+        loadTrafficRecordings();
+    } else {
+        addLog('保存录制失败: ' + (result.error || '未知错误'), 'error');
+    }
+}
+
+async function loadTrafficRecordings() {
+    const result = await apiRequest('/recordings');
+    if (result.success) {
+        trafficRecordings = result.data;
+        renderRecordingList();
+        loadCompareRecordingOptions();
+    } else {
+        document.getElementById('recordingList').innerHTML =
+            '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">加载失败</p>';
+    }
+}
+
+function renderRecordingList() {
+    const list = document.getElementById('recordingList');
+
+    if (trafficRecordings.length === 0) {
+        list.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">暂无录制</p>';
+        return;
+    }
+
+    let html = '';
+    trafficRecordings.forEach(rec => {
+        const date = new Date(rec.createdAt).toLocaleString();
+        html += `
+            <div class="recording-item">
+                <div class="recording-item-header">
+                    <span class="recording-item-name" title="${escapeHtml(rec.name)}">${escapeHtml(rec.name)}</span>
+                </div>
+                <div class="recording-item-meta">
+                    <span>${date}</span>
+                    <span>时长: ${rec.duration.toFixed(1)}s</span>
+                    <span>事件: ${rec.eventCount}</span>
+                </div>
+                <div class="recording-item-buttons">
+                    <button class="btn btn-small btn-primary" onclick="playRecording(${rec.id})">回放</button>
+                    <button class="btn btn-small btn-danger" onclick="deleteRecording(${rec.id})">删除</button>
+                </div>
+            </div>
+        `;
+    });
+
+    list.innerHTML = html;
+}
+
+window.playRecording = async function(recordingId) {
+    if (isRecording) {
+        alert('正在录制中，请先停止录制');
+        return;
+    }
+    if (isPlayback) {
+        exitPlayback();
+    }
+
+    const result = await apiRequest('/recordings/' + recordingId);
+    if (!result.success) {
+        alert('加载录制失败: ' + (result.error || '未知错误'));
+        return;
+    }
+
+    playbackData = result.data;
+    isPlayback = true;
+    playbackPaused = false;
+    playbackCurrentTime = 0;
+    playbackLinkLoads.clear();
+    playbackCongestion.clear();
+
+    document.getElementById('playbackOverlay').style.display = 'block';
+    document.getElementById('eventTimeline').style.display = 'block';
+    document.getElementById('playbackRecordingName').textContent = playbackData.name;
+    document.getElementById('playbackTotalTime').textContent = playbackData.duration.toFixed(1) + 's';
+
+    document.getElementById('injectBtn').disabled = true;
+    document.getElementById('injectBtn').style.opacity = '0.5';
+
+    renderEventTimeline();
+    startPlaybackTimer();
+    addLog(`开始回放: ${playbackData.name}`, 'info');
+};
+
+window.deleteRecording = async function(recordingId) {
+    if (!confirm('确定要删除这份录制吗？')) return;
+    const result = await apiRequest('/recordings/' + recordingId, { method: 'DELETE' });
+    if (result.success) {
+        addLog('录制已删除', 'success');
+        loadTrafficRecordings();
+    } else {
+        alert('删除失败: ' + (result.error || '未知错误'));
+    }
+};
+
+function startPlaybackTimer() {
+    clearInterval(playbackTimer);
+    const tickInterval = 50;
+    playbackTimer = setInterval(() => {
+        if (playbackPaused || !playbackData) return;
+
+        playbackCurrentTime += tickInterval / 1000;
+        if (playbackCurrentTime >= playbackData.duration) {
+            playbackCurrentTime = playbackData.duration;
+            updatePlaybackUI();
+            applyPlaybackFrame();
+            addLog('回放结束', 'info');
+            return;
+        }
+
+        updatePlaybackUI();
+        applyPlaybackFrame();
+    }, tickInterval);
+}
+
+function updatePlaybackUI() {
+    if (!playbackData) return;
+    const pct = (playbackCurrentTime / playbackData.duration) * 100;
+    document.getElementById('playbackProgressBar').style.width = pct + '%';
+    document.getElementById('playbackSeekBar').value = pct;
+    document.getElementById('playbackCurrentTime').textContent = playbackCurrentTime.toFixed(1) + 's';
+}
+
+function applyPlaybackFrame() {
+    if (!playbackData) return;
+    playbackLinkLoads.clear();
+    playbackCongestion.clear();
+
+    Object.keys(playbackData.linkSamples).forEach(linkKey => {
+        const samples = playbackData.linkSamples[linkKey];
+        if (!samples || samples.length === 0) return;
+
+        let closest = samples[0];
+        for (let i = 1; i < samples.length; i++) {
+            if (Math.abs(samples[i].time - playbackCurrentTime) < Math.abs(closest.time - playbackCurrentTime)) {
+                closest = samples[i];
+            } else {
+                break;
+            }
+        }
+
+        const [fromId, toId] = linkKey.split('-').map(Number);
+        const link = links.find(l =>
+            (l.from === fromId && l.to === toId) ||
+            (l.from === toId && l.to === fromId)
+        );
+        if (link) {
+            playbackLinkLoads.set(link.id, closest.load);
+            if (closest.load > 0.85) {
+                playbackCongestion.add(link.id);
+            }
+        }
+    });
+}
+
+function togglePlaybackPause() {
+    playbackPaused = !playbackPaused;
+    document.getElementById('playbackPauseBtn').textContent = playbackPaused ? '继续' : '暂停';
+    addLog(playbackPaused ? '回放已暂停' : '回放继续', 'info');
+}
+
+function seekPlayback(time) {
+    if (!playbackData) return;
+    playbackCurrentTime = Math.max(0, Math.min(playbackData.duration, time));
+    updatePlaybackUI();
+    applyPlaybackFrame();
+}
+
+function exitPlayback() {
+    isPlayback = false;
+    playbackPaused = false;
+    clearInterval(playbackTimer);
+    playbackTimer = null;
+    playbackData = null;
+    playbackLinkLoads.clear();
+    playbackCongestion.clear();
+
+    document.getElementById('playbackOverlay').style.display = 'none';
+    document.getElementById('eventTimeline').style.display = 'none';
+
+    document.getElementById('injectBtn').disabled = false;
+    document.getElementById('injectBtn').style.opacity = '1';
+
+    addLog('已退出回放，恢复实时模式', 'info');
+}
+
+const originalDrawLink2 = drawLink;
+drawLink = function(link) {
+    if (!isPlayback) {
+        originalDrawLink2(link);
+        return;
+    }
+
+    const from = devices.find(d => d.id === link.from);
+    const to = devices.find(d => d.id === link.to);
+    if (!from || !to) return;
+
+    let lineWidth = 2 + (link.bandwidth / 10000) * 6;
+    let color = '#52c41a';
+    let isDisabled = !link.enabled;
+
+    if (isDisabled) {
+        color = '#bfbfbf';
+    } else {
+        const loadRatio = playbackLinkLoads.get(link.id) || 0;
+        const isCongested = playbackCongestion.has(link.id);
+
+        if (loadRatio > 0.85) {
+            color = '#ff4d4f';
+        } else if (loadRatio > 0.6) {
+            color = '#faad14';
+        }
+
+        if (isCongested) {
+            const flash = Math.sin(Date.now() / 100) > 0;
+            if (flash) {
+                color = '#ff0000';
+            }
+        }
+    }
+
+    if (selectedLink && selectedLink.id === link.id) {
+        lineWidth += 2;
+    }
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = lineWidth;
+    ctx.lineCap = 'round';
+
+    if (isDisabled) {
+        ctx.setLineDash([8, 6]);
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(from.x, from.y);
+    ctx.lineTo(to.x, to.y);
+    ctx.stroke();
+
+    if (isDisabled) {
+        ctx.setLineDash([]);
+    }
+
+    const midX = (from.x + to.x) / 2;
+    const midY = (from.y + to.y) / 2;
+
+    const loadRatio = (playbackLinkLoads.get(link.id) || 0) * 100;
+    let label;
+    if (isDisabled) {
+        label = '已禁用';
+    } else {
+        label = `${link.bandwidth}Mbps/${link.delay}ms ${loadRatio.toFixed(0)}%`;
+    }
+
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = isDisabled ? '#d9d9d9' : '#999';
+    ctx.lineWidth = 1;
+
+    ctx.font = '10px -apple-system, sans-serif';
+    const textWidth = ctx.measureText(label).width;
+
+    ctx.fillRect(midX - textWidth / 2 - 4, midY - 7, textWidth + 8, 14);
+    ctx.strokeRect(midX - textWidth / 2 - 4, midY - 7, textWidth + 8, 14);
+
+    ctx.fillStyle = isDisabled ? '#bfbfbf' : '#666';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, midX, midY);
+};
+
+function renderEventTimeline() {
+    if (!playbackData) return;
+
+    const eventsContainer = document.getElementById('eventTimelineEvents');
+    const track = document.getElementById('eventTimelineTrack');
+    const trackWidth = track.clientWidth || 800;
+    const duration = playbackData.duration || 1;
+
+    const eventTypeLabels = {
+        'inject': '流量注入',
+        'complete': '流量完成',
+        'congestion-start': '拥塞开始',
+        'congestion-end': '拥塞结束',
+        'loss': '丢包'
+    };
+
+    let html = '';
+    playbackData.events.forEach((event, idx) => {
+        const left = (event.time / duration) * 100;
+        let tooltip = `${eventTypeLabels[event.type] || event.type} @ T+${event.time.toFixed(1)}s`;
+        if (event.linkName) tooltip += `\n链路: ${event.linkName}`;
+        if (event.flowSrc && event.flowDst) tooltip += `\n流量: ${event.flowSrc} → ${event.flowDst}`;
+
+        html += `
+            <div class="event-marker event-${event.type}" 
+                 style="left: ${left}%;"
+                 data-event-idx="${idx}"
+                 onclick="jumpToEvent(${event.time})"
+                 title="${escapeHtml(tooltip)}">
+                <div class="event-tooltip">${escapeHtml(tooltip).replace(/\n/g, '<br>')}</div>
+            </div>
+        `;
+    });
+
+    eventsContainer.innerHTML = html;
+}
+
+window.jumpToEvent = function(time) {
+    seekPlayback(time);
+    if (playbackPaused) {
+        togglePlaybackPause();
+    }
+};
+
+async function loadCompareRecordingOptions() {
+    const select1 = document.getElementById('compareRecording1');
+    const select2 = document.getElementById('compareRecording2');
+
+    if (trafficRecordings.length === 0) {
+        select1.innerHTML = '<option value="">暂无录制</option>';
+        select2.innerHTML = '<option value="">暂无录制</option>';
+        return;
+    }
+
+    select1.innerHTML = '<option value="">选择录制 A</option>';
+    select2.innerHTML = '<option value="">选择录制 B</option>';
+
+    trafficRecordings.forEach(rec => {
+        const date = new Date(rec.createdAt).toLocaleString();
+        const label = `${rec.name} - ${date}`;
+
+        const opt1 = document.createElement('option');
+        opt1.value = rec.id;
+        opt1.textContent = label;
+        select1.appendChild(opt1);
+
+        const opt2 = document.createElement('option');
+        opt2.value = rec.id;
+        opt2.textContent = label;
+        select2.appendChild(opt2);
+    });
+}
+
+async function doCompareRecordings() {
+    const id1 = parseInt(document.getElementById('compareRecording1').value);
+    const id2 = parseInt(document.getElementById('compareRecording2').value);
+
+    if (!id1 || !id2) {
+        alert('请选择两份录制');
+        return;
+    }
+
+    if (id1 === id2) {
+        alert('请选择不同的录制进行对比');
+        return;
+    }
+
+    const result = await apiRequest(`/recordings/compare/${id1}/${id2}`);
+    if (result.success) {
+        currentCompareRecordingData = result.data;
+        renderRecordingCompareResults();
+    } else {
+        alert('对比失败: ' + (result.error || '未知错误'));
+    }
+}
+
+function renderRecordingCompareResults() {
+    if (!currentCompareRecordingData) return;
+
+    document.getElementById('recordingCompareEmpty').style.display = 'none';
+    document.getElementById('recordingCompareResults').style.display = 'block';
+
+    const { recording1, recording2, links } = currentCompareRecordingData;
+    const topLinks = links.slice(0, 10);
+
+    const date1 = new Date(recording1.createdAt).toLocaleString();
+    const date2 = new Date(recording2.createdAt).toLocaleString();
+
+    const overview = document.getElementById('recordingCompareOverview');
+    overview.innerHTML = `
+        <div class="report-stat-row">
+            <span class="report-stat-label">录制 A</span>
+            <span class="report-stat-value">${escapeHtml(recording1.name)}</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">录制 B</span>
+            <span class="report-stat-value">${escapeHtml(recording2.name)}</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">A 时长</span>
+            <span class="report-stat-value">${recording1.duration.toFixed(1)}s</span>
+        </div>
+        <div class="report-stat-row">
+            <span class="report-stat-label">B 时长</span>
+            <span class="report-stat-value">${recording2.duration.toFixed(1)}s</span>
+        </div>
+    `;
+
+    const tableEl = document.getElementById('recordingCompareTable');
+    let html = '<div class="recording-compare-header">';
+    html += '<span>链路名称</span>';
+    html += '<span>平均负载差</span>';
+    html += '<span>峰值负载差</span>';
+    html += '<span>拥塞时长差</span>';
+    html += '</div>';
+
+    topLinks.forEach(link => {
+        const avgA = (link.recording1.avgLoad * 100).toFixed(1);
+        const avgB = (link.recording2.avgLoad * 100).toFixed(1);
+        const avgDiff = link.avgLoadDiff * 100;
+        const avgColor = avgDiff > 0 ? '#ff4d4f' : (avgDiff < 0 ? '#52c41a' : '#333');
+
+        const peakA = (link.recording1.peakLoad * 100).toFixed(1);
+        const peakB = (link.recording2.peakLoad * 100).toFixed(1);
+        const peakDiff = link.peakLoadDiff * 100;
+        const peakColor = peakDiff > 0 ? '#ff4d4f' : (peakDiff < 0 ? '#52c41a' : '#333');
+
+        const congA = link.recording1.congestionDuration.toFixed(1);
+        const congB = link.recording2.congestionDuration.toFixed(1);
+        const congDiff = link.congestionDurationDiff;
+        const congColor = congDiff > 0 ? '#ff4d4f' : (congDiff < 0 ? '#52c41a' : '#333');
+
+        html += `<div class="recording-compare-row">
+            <span class="recording-compare-link" title="${escapeHtml(link.linkName)}">${escapeHtml(link.linkName)}</span>
+            <span class="recording-compare-value" style="color:${avgColor};">
+                ${avgA}% → ${avgB}%
+                <br><small>(${avgDiff > 0 ? '+' : ''}${avgDiff.toFixed(1)}%)</small>
+            </span>
+            <span class="recording-compare-value" style="color:${peakColor};">
+                ${peakA}% → ${peakB}%
+                <br><small>(${peakDiff > 0 ? '+' : ''}${peakDiff.toFixed(1)}%)</small>
+            </span>
+            <span class="recording-compare-value" style="color:${congColor};">
+                ${congA}s → ${congB}s
+                <br><small>(${congDiff > 0 ? '+' : ''}${congDiff.toFixed(1)}s)</small>
+            </span>
+        </div>`;
+    });
+
+    if (topLinks.length === 0) {
+        html += '<div class="recording-compare-row" style="justify-content:center;color:#999;padding:15px;">无差异数据</div>';
+    }
+
+    tableEl.innerHTML = html;
+}
+
 const originalInit3 = init;
 init = function() {
     originalInit3();
     setupBackendEvents();
     setupConfigAuditEvents();
+    setupTrafficRecordingEvents();
     loadTopologyVersions();
+    loadTrafficRecordings();
 
     if (devices.length > 0) {
         setTimeout(() => runAudit(), 1000);

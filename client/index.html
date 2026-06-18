@@ -173,6 +173,29 @@
                 <button id="importBtn" class="btn">导入JSON</button>
                 <input type="file" id="importFile" accept=".json" style="display: none;">
             </div>
+
+            <h3>流量录制回放</h3>
+            <div class="traffic-recording-panel">
+                <div class="form-group">
+                    <label>录制名称</label>
+                    <input type="text" id="recordingName" placeholder="可选，留空自动命名">
+                </div>
+                <div class="recording-status" id="recordingStatus" style="display:none;">
+                    <span class="recording-dot"></span>
+                    <span id="recordingTime">0.0s</span>
+                </div>
+                <div class="io-panel">
+                    <button id="startRecordingBtn" class="btn btn-primary">开始录制</button>
+                    <button id="stopRecordingBtn" class="btn btn-danger" style="display:none;">停止录制</button>
+                </div>
+                <div class="form-group" style="margin-top: 10px;">
+                    <label>历史录制 (最多10份)</label>
+                    <button id="refreshRecordingsBtn" class="btn btn-small" style="float:right;">刷新</button>
+                </div>
+                <div class="recording-list" id="recordingList">
+                    <p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">加载中...</p>
+                </div>
+            </div>
         </div>
 
         <div class="canvas-container">
@@ -184,7 +207,36 @@
                 <span class="divider"></span>
                 <span id="deviceCount">设备: 0/50</span>
             </div>
+            <div id="playbackOverlay" class="playback-overlay" style="display:none;">
+                <div class="playback-controls">
+                    <div class="playback-title">
+                        <span class="playback-icon">▶</span>
+                        <span id="playbackRecordingName">回放中</span>
+                    </div>
+                    <div class="playback-progress-container">
+                        <span id="playbackCurrentTime">0.0s</span>
+                        <div class="playback-progress">
+                            <div class="playback-progress-bar" id="playbackProgressBar"></div>
+                            <input type="range" id="playbackSeekBar" min="0" max="100" value="0" step="0.1">
+                        </div>
+                        <span id="playbackTotalTime">0.0s</span>
+                    </div>
+                    <div class="playback-buttons">
+                        <button id="playbackPauseBtn" class="btn btn-small btn-primary">暂停</button>
+                        <button id="playbackExitBtn" class="btn btn-small btn-danger">退出回放</button>
+                    </div>
+                </div>
+            </div>
             <canvas id="topologyCanvas"></canvas>
+            <div id="eventTimeline" class="event-timeline" style="display:none;">
+                <div class="event-timeline-header">
+                    <span>事件时间线</span>
+                </div>
+                <div class="event-timeline-track" id="eventTimelineTrack">
+                    <div class="event-timeline-ruler" id="eventTimelineRuler"></div>
+                    <div class="event-timeline-events" id="eventTimelineEvents"></div>
+                </div>
+            </div>
             <div id="logPanel" class="log-panel">
                 <h4>传输日志</h4>
                 <div id="logContent"></div>
@@ -366,6 +418,40 @@
                             选择两份报告进行对比
                         </p>
                     </div>
+                </div>
+            </div>
+
+            <h3>流量录制差异分析</h3>
+            <div class="recording-compare-panel">
+                <div class="compare-selectors">
+                    <div class="form-group">
+                        <label>录制 A</label>
+                        <select id="compareRecording1">
+                            <option value="">选择录制</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>录制 B</label>
+                        <select id="compareRecording2">
+                            <option value="">选择录制</option>
+                        </select>
+                    </div>
+                    <button id="doCompareRecordingsBtn" class="btn btn-primary">开始对比</button>
+                </div>
+                <div class="recording-compare-results" id="recordingCompareResults" style="display:none;">
+                    <div class="compare-overview">
+                        <h4>对比总览</h4>
+                        <div class="report-stats" id="recordingCompareOverview"></div>
+                    </div>
+                    <div class="compare-links-section">
+                        <h4>链路差异 Top 10</h4>
+                        <div class="recording-compare-table" id="recordingCompareTable"></div>
+                    </div>
+                </div>
+                <div class="compare-empty" id="recordingCompareEmpty">
+                    <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">
+                        选择两份录制进行对比
+                    </p>
                 </div>
             </div>
         </div>

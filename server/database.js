@@ -102,6 +102,25 @@ function initDatabase() {
       db.run(`
         CREATE INDEX IF NOT EXISTS idx_partition_changes_timestamp 
         ON partition_changes(timestamp DESC)
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS traffic_recordings (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          duration REAL NOT NULL,
+          sample_count INTEGER NOT NULL,
+          event_count INTEGER NOT NULL,
+          link_samples TEXT NOT NULL,
+          events TEXT NOT NULL,
+          topology_snapshot TEXT,
+          created_at INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_traffic_recordings_created 
+        ON traffic_recordings(created_at DESC)
       `, (err) => {
         if (err) reject(err);
         else resolve();
@@ -658,6 +677,243 @@ function listPartitionChanges(limit = 50) {
   });
 }
 
+const MAX_TRAFFIC_RECORDINGS = 10;
+
+function saveTrafficRecording(recordingData) {
+  return new Promise((resolve, reject) => {
+    const { name, duration, sampleCount, eventCount, linkSamples, events, topologySnapshot } = recordingData;
+
+    db.get('SELECT COUNT(*) as count FROM traffic_recordings', (err, countRow) => {
+      if (err) return reject(err);
+
+      const currentCount = countRow.count;
+
+      const deleteOldIfNeeded = () => {
+        return new Promise((res, rej) => {
+          if (currentCount >= MAX_TRAFFIC_RECORDINGS) {
+            const toDelete = currentCount - MAX_TRAFFIC_RECORDINGS + 1;
+            db.run(`
+              DELETE FROM traffic_recordings 
+              WHERE id IN (
+                SELECT id FROM traffic_recordings 
+                ORDER BY created_at ASC 
+                LIMIT ?
+              )
+            `, [toDelete], (err) => {
+              if (err) rej(err);
+              else res();
+            });
+          } else {
+            res();
+          }
+        });
+      };
+
+      deleteOldIfNeeded()
+        .then(() => {
+          const stmt = db.prepare(`
+            INSERT INTO traffic_recordings 
+              (name, duration, sample_count, event_count, link_samples, events, topology_snapshot, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+
+          stmt.run(
+            name || `录制 ${new Date().toLocaleString()}`,
+            duration || 0,
+            sampleCount || 0,
+            eventCount || 0,
+            JSON.stringify(linkSamples || {}),
+            JSON.stringify(events || []),
+            topologySnapshot ? JSON.stringify(topologySnapshot) : null,
+            Date.now(),
+            function(err) {
+              if (err) return reject(err);
+              resolve({
+                id: this.lastID,
+                name: name || `录制 ${new Date().toLocaleString()}`,
+                duration,
+                sampleCount,
+                eventCount,
+                createdAt: Date.now()
+              });
+            }
+          );
+        })
+        .catch(reject);
+    });
+  });
+}
+
+function listTrafficRecordings() {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT id, name, duration, sample_count, event_count, created_at 
+      FROM traffic_recordings 
+      ORDER BY created_at DESC
+    `, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        duration: row.duration,
+        sampleCount: row.sample_count,
+        eventCount: row.event_count,
+        createdAt: row.created_at
+      })));
+    });
+  });
+}
+
+function getTrafficRecording(recordingId) {
+  return new Promise((resolve, reject) => {
+    db.get(`
+      SELECT * FROM traffic_recordings WHERE id = ?
+    `, [recordingId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+
+      resolve({
+        id: row.id,
+        name: row.name,
+        duration: row.duration,
+        sampleCount: row.sample_count,
+        eventCount: row.event_count,
+        linkSamples: JSON.parse(row.link_samples),
+        events: JSON.parse(row.events),
+        topologySnapshot: row.topology_snapshot ? JSON.parse(row.topology_snapshot) : null,
+        createdAt: row.created_at
+      });
+    });
+  });
+}
+
+function deleteTrafficRecording(recordingId) {
+  return new Promise((resolve, reject) => {
+    db.run('DELETE FROM traffic_recordings WHERE id = ?', [recordingId], (err) => {
+      if (err) return reject(err);
+      resolve({ success: true });
+    });
+  });
+}
+
+async function compareTrafficRecordings(recordingId1, recordingId2) {
+  const rec1 = await getTrafficRecording(recordingId1);
+  const rec2 = await getTrafficRecording(recordingId2);
+
+  if (!rec1 || !rec2) {
+    return null;
+  }
+
+  const linkSamples1 = rec1.linkSamples || {};
+  const linkSamples2 = rec2.linkSamples || {};
+
+  function buildLinkKey(fromId, toId) {
+    return `${fromId}-${toId}`;
+  }
+
+  function getLinkDisplayName(fromId, toId) {
+    const snap = rec1.topologySnapshot || rec2.topologySnapshot;
+    if (snap && snap.devices) {
+      const fromDev = snap.devices.find(d => d.id === fromId || d.id === parseInt(fromId));
+      const toDev = snap.devices.find(d => d.id === toId || d.id === parseInt(toId));
+      if (fromDev && toDev) {
+        return `${fromDev.name} - ${toDev.name}`;
+      }
+    }
+    return `Link ${fromId}-${toId}`;
+  }
+
+  function getLinkBandwidth(linkKey) {
+    const snap = rec1.topologySnapshot || rec2.topologySnapshot;
+    if (snap && snap.links) {
+      const [fromId, toId] = linkKey.split('-').map(Number);
+      const link = snap.links.find(l =>
+        (l.from === fromId && l.to === toId) ||
+        (l.from === toId && l.to === fromId)
+      );
+      return link ? link.bandwidth : null;
+    }
+    return null;
+  }
+
+  function analyzeSamples(samples) {
+    if (!samples || samples.length === 0) {
+      return { avgLoad: 0, peakLoad: 0, congestionDuration: 0 };
+    }
+    const loads = samples.map(s => s.load || 0);
+    const avgLoad = loads.reduce((a, b) => a + b, 0) / loads.length;
+    const peakLoad = Math.max(...loads);
+    const congestedSamples = loads.filter(l => l > 0.85).length;
+    const congestionDuration = congestedSamples * 0.2;
+    return { avgLoad, peakLoad, congestionDuration };
+  }
+
+  const allLinkKeys = new Set([
+    ...Object.keys(linkSamples1),
+    ...Object.keys(linkSamples2)
+  ]);
+
+  const linkComparisons = [];
+
+  allLinkKeys.forEach(linkKey => {
+    const samples1 = linkSamples1[linkKey] || [];
+    const samples2 = linkSamples2[linkKey] || [];
+
+    const stats1 = analyzeSamples(samples1);
+    const stats2 = analyzeSamples(samples2);
+
+    const avgLoadDiff = stats2.avgLoad - stats1.avgLoad;
+    const peakLoadDiff = stats2.peakLoad - stats1.peakLoad;
+    const congestionDurationDiff = stats2.congestionDuration - stats1.congestionDuration;
+    const totalDiff = Math.abs(avgLoadDiff) * 2 + Math.abs(peakLoadDiff) + Math.abs(congestionDurationDiff) * 0.5;
+
+    const [fromId, toId] = linkKey.split('-');
+
+    linkComparisons.push({
+      linkKey,
+      linkName: getLinkDisplayName(fromId, toId),
+      bandwidth: getLinkBandwidth(linkKey),
+      recording1: {
+        avgLoad: stats1.avgLoad,
+        peakLoad: stats1.peakLoad,
+        congestionDuration: stats1.congestionDuration
+      },
+      recording2: {
+        avgLoad: stats2.avgLoad,
+        peakLoad: stats2.peakLoad,
+        congestionDuration: stats2.congestionDuration
+      },
+      avgLoadDiff,
+      peakLoadDiff,
+      congestionDurationDiff,
+      totalDiff,
+      existsInBoth: samples1.length > 0 && samples2.length > 0
+    });
+  });
+
+  linkComparisons.sort((a, b) => b.totalDiff - a.totalDiff);
+
+  return {
+    recording1: {
+      id: rec1.id,
+      name: rec1.name,
+      duration: rec1.duration,
+      sampleCount: rec1.sampleCount,
+      eventCount: rec1.eventCount,
+      createdAt: rec1.createdAt
+    },
+    recording2: {
+      id: rec2.id,
+      name: rec2.name,
+      duration: rec2.duration,
+      sampleCount: rec2.sampleCount,
+      eventCount: rec2.eventCount,
+      createdAt: rec2.createdAt
+    },
+    links: linkComparisons.slice(0, 50)
+  };
+}
+
 module.exports = {
   initDatabase,
   saveTopology,
@@ -675,5 +931,10 @@ module.exports = {
   getAuditReport,
   compareAuditReports,
   savePartitionChange,
-  listPartitionChanges
+  listPartitionChanges,
+  saveTrafficRecording,
+  listTrafficRecordings,
+  getTrafficRecording,
+  deleteTrafficRecording,
+  compareTrafficRecordings
 };
