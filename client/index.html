@@ -43,6 +43,13 @@
                     <label>发送速率 (Mbps)</label>
                     <input type="number" id="sendRate" value="10" min="1">
                 </div>
+                <div class="form-group">
+                    <label>流量优先级</label>
+                    <select id="trafficPriority">
+                        <option value="normal">普通</option>
+                        <option value="priority">优先</option>
+                    </select>
+                </div>
                 <button id="injectBtn" class="btn btn-primary">注入流量</button>
                 <div class="active-traffic">
                     <h4>活跃流量 (<span id="trafficCount">0</span>/10)</h4>
@@ -87,6 +94,13 @@
                         <div class="form-group">
                             <label>速率(Mbps)</label>
                             <input type="number" id="eventRate" value="10" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label>优先级</label>
+                            <select id="eventPriority">
+                                <option value="normal">普通</option>
+                                <option value="priority">优先</option>
+                            </select>
                         </div>
                         <button id="addEventBtn" class="btn btn-small btn-primary">添加事件</button>
                     </div>
@@ -181,6 +195,13 @@
             <h3>属性面板</h3>
             <div id="propertyPanel" class="property-panel">
                 <p class="hint">请选择设备或链路查看属性</p>
+            </div>
+
+            <h3>QoS统计</h3>
+            <div class="qos-stats-panel">
+                <div id="qosStatsContent">
+                    <p class="hint">暂无链路数据</p>
+                </div>
             </div>
 
             <h3>路由表</h3>
@@ -360,6 +381,11 @@
             <div class="form-group">
                 <label>延迟 (ms)</label>
                 <input type="number" id="linkDelay" value="10" min="1" max="500">
+            </div>
+            <div class="form-group">
+                <label>带宽预留比例: <span id="linkReserveLabel">0%</span></label>
+                <input type="range" id="linkReservation" min="0" max="80" value="0" step="5" style="width:100%;">
+                <div class="qos-hint">预留带宽仅供优先流量使用，普通流量不可借用</div>
             </div>
             <div class="modal-buttons">
                 <button id="cancelLinkConfig" class="btn">取消</button>

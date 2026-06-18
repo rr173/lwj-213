@@ -1620,3 +1620,135 @@ body {
     color: #fff;
 }
 
+.qos-hint {
+    font-size: 11px;
+    color: #999;
+    margin-top: 4px;
+    line-height: 1.4;
+}
+
+.qos-stats-panel {
+    font-size: 12px;
+}
+
+.qos-link-item {
+    padding: 8px 10px;
+    background: #f5f7fa;
+    border-radius: 4px;
+    margin-bottom: 8px;
+    border: 1px solid #e8e8e8;
+}
+
+.qos-link-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.qos-link-name {
+    font-weight: 500;
+    color: #333;
+    font-size: 11px;
+}
+
+.qos-link-bw {
+    color: #999;
+    font-size: 10px;
+}
+
+.qos-pool-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+    font-size: 11px;
+}
+
+.qos-pool-label {
+    width: 40px;
+    font-size: 10px;
+    flex-shrink: 0;
+}
+
+.qos-pool-label.qos-reserved {
+    color: #722ed1;
+}
+
+.qos-pool-label.qos-besteffort {
+    color: #fa8c16;
+}
+
+.qos-pool-bw {
+    width: 36px;
+    color: #666;
+    font-size: 10px;
+    flex-shrink: 0;
+    text-align: right;
+}
+
+.qos-pool-bar {
+    flex: 1;
+    height: 6px;
+    background: #e0e0e0;
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.qos-pool-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s;
+}
+
+.qos-reserved-fill {
+    background: #722ed1;
+}
+
+.qos-besteffort-fill {
+    background: #fa8c16;
+}
+
+.qos-pool-pct {
+    width: 40px;
+    text-align: right;
+    color: #333;
+    font-size: 10px;
+    flex-shrink: 0;
+}
+
+.qos-flow-counts {
+    display: flex;
+    gap: 12px;
+    margin-top: 4px;
+    font-size: 10px;
+    color: #666;
+}
+
+.qos-priority-count {
+    color: #722ed1;
+}
+
+.qos-normal-count {
+    color: #999;
+}
+
+.qos-section-title {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed #d9d9d9;
+}
+
+.report-link-pool-stats {
+    display: flex;
+    gap: 10px;
+    font-size: 10px;
+    margin: 3px 0;
+}
+
+.prop-row .prop-input[type="range"] {
+    padding: 0;
+    border: none;
+    height: 20px;
+}
+

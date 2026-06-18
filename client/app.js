@@ -505,13 +505,14 @@ function hasLinkBetween(fromId, toId) {
     );
 }
 
-function addLink(fromId, toId, bandwidth, delay) {
+function addLink(fromId, toId, bandwidth, delay, reservationRatio) {
     const link = {
         id: linkIdCounter++,
         from: fromId,
         to: toId,
         bandwidth: bandwidth,
         delay: delay,
+        reservationRatio: reservationRatio || 0,
         enabled: true
     };
     
@@ -739,6 +740,99 @@ function getLinkLoad(linkId) {
     return totalRate / (link.bandwidth * 1000000);
 }
 
+function getPriorityRateOnLink(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (!link || !link.enabled) return 0;
+
+    let totalRate = 0;
+    trafficFlows.forEach(flow => {
+        if (flow.priority !== 'priority' || flow.completed || flow.paused) return;
+        if (flow.path && flow.path.segments && flow.path.segments.some(seg =>
+            (seg.from === link.from && seg.to === link.to) ||
+            (seg.from === link.to && seg.to === link.from)
+        )) {
+            totalRate += flow.rate;
+        }
+    });
+    return totalRate;
+}
+
+function getNormalRateOnLink(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (!link || !link.enabled) return 0;
+
+    let totalRate = 0;
+    trafficFlows.forEach(flow => {
+        if (flow.priority === 'priority' || flow.completed || flow.paused) return;
+        if (flow.path && flow.path.segments && flow.path.segments.some(seg =>
+            (seg.from === link.from && seg.to === link.to) ||
+            (seg.from === link.to && seg.to === link.from)
+        )) {
+            totalRate += flow.rate;
+        }
+    });
+    return totalRate;
+}
+
+function getReservedPoolLoad(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (!link || !link.enabled) return 0;
+    const reservedBw = link.bandwidth * (link.reservationRatio || 0) / 100;
+    if (reservedBw <= 0) return 0;
+    const priorityRate = getPriorityRateOnLink(linkId);
+    return priorityRate / (reservedBw * 1000000);
+}
+
+function getBestEffortPoolLoad(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (!link || !link.enabled) return 0;
+    const reservedBw = link.bandwidth * (link.reservationRatio || 0) / 100;
+    const bestEffortBw = link.bandwidth - reservedBw;
+    if (bestEffortBw <= 0) return 0;
+    const normalRate = getNormalRateOnLink(linkId);
+    return normalRate / (bestEffortBw * 1000000);
+}
+
+function getLinkQoSStats(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (!link || !link.enabled) return null;
+
+    const reservedBw = link.bandwidth * (link.reservationRatio || 0) / 100;
+    const bestEffortBw = link.bandwidth - reservedBw;
+
+    let priorityCount = 0;
+    let normalCount = 0;
+    let priorityRate = 0;
+    let normalRate = 0;
+
+    trafficFlows.forEach(flow => {
+        if (flow.completed || flow.paused) return;
+        if (flow.path && flow.path.segments && flow.path.segments.some(seg =>
+            (seg.from === link.from && seg.to === link.to) ||
+            (seg.from === link.to && seg.to === link.from)
+        )) {
+            if (flow.priority === 'priority') {
+                priorityCount++;
+                priorityRate += flow.rate;
+            } else {
+                normalCount++;
+                normalRate += flow.rate;
+            }
+        }
+    });
+
+    return {
+        reservedBw,
+        bestEffortBw,
+        reservedPoolUsage: reservedBw > 0 ? (priorityRate / (reservedBw * 1000000) * 100) : 0,
+        bestEffortPoolUsage: bestEffortBw > 0 ? (normalRate / (bestEffortBw * 1000000) * 100) : 0,
+        priorityCount,
+        normalCount,
+        priorityRate: priorityRate / 1000000,
+        normalRate: normalRate / 1000000
+    };
+}
+
 function getLinkRequestedLoad(linkId) {
     const link = links.find(l => l.id === linkId);
     if (!link || !link.enabled) return 0;
@@ -922,7 +1016,7 @@ function getNextHop(srcId, dstId) {
 function updateRoutingTables() {
 }
 
-function injectTraffic(srcId, dstId, dataSizeKB, rateMbps) {
+function injectTraffic(srcId, dstId, dataSizeKB, rateMbps, priority) {
     if (trafficFlows.length >= MAX_TRAFFIC_FLOWS) {
         addLog('活跃流量已达上限（10条）', 'error');
         return false;
@@ -937,6 +1031,27 @@ function injectTraffic(srcId, dstId, dataSizeKB, rateMbps) {
     if (!pathResult) {
         addLog(`从 ${getDeviceName(srcId)} 到 ${getDeviceName(dstId)} 不可达`, 'error');
         return false;
+    }
+
+    const isPriority = priority === 'priority';
+    let demoted = false;
+
+    if (isPriority) {
+        for (const seg of pathResult.segments) {
+            const link = seg.link;
+            const reservedBw = link.bandwidth * (link.reservationRatio || 0) / 100 * 1000000;
+            const priorityRateOnLink = getPriorityRateOnLink(link.id);
+            if (priorityRateOnLink + rateMbps * 1000000 > reservedBw && reservedBw > 0) {
+                demoted = true;
+                break;
+            } else if (reservedBw === 0) {
+                demoted = true;
+                break;
+            }
+        }
+        if (demoted) {
+            addLog(`预留带宽不足,降级为普通: ${getDeviceName(srcId)} → ${getDeviceName(dstId)}`, 'warning');
+        }
     }
     
     const flow = {
@@ -953,7 +1068,9 @@ function injectTraffic(srcId, dstId, dataSizeKB, rateMbps) {
         totalPackets: Math.ceil(dataSizeKB / 10),
         sentPackets: 0,
         lostPackets: 0,
-        completed: false
+        completed: false,
+        priority: demoted ? 'normal' : (priority || 'normal'),
+        demoted: demoted
     };
     
     trafficFlows.push(flow);
@@ -968,7 +1085,14 @@ function updateLinkCongestion() {
     const linkLoads = new Map();
     
     links.forEach(link => {
-        linkLoads.set(link.id, { totalRequest: 0, flows: [] });
+        linkLoads.set(link.id, { 
+            totalRequest: 0, 
+            priorityRequest: 0,
+            normalRequest: 0,
+            priorityFlows: [],
+            normalFlows: [],
+            flows: []
+        });
     });
     
     trafficFlows.forEach(flow => {
@@ -981,30 +1105,68 @@ function updateLinkCongestion() {
             if (loadInfo) {
                 loadInfo.totalRequest += flow.rate;
                 loadInfo.flows.push(flow);
+                if (flow.priority === 'priority') {
+                    loadInfo.priorityRequest += flow.rate;
+                    loadInfo.priorityFlows.push(flow);
+                } else {
+                    loadInfo.normalRequest += flow.rate;
+                    loadInfo.normalFlows.push(flow);
+                }
             }
         });
     });
     
     links.forEach(link => {
         const loadInfo = linkLoads.get(link.id);
-        const loadRatio = loadInfo.totalRequest / (link.bandwidth * 1000000);
-        
-        if (loadRatio > 1) {
-            const ratio = (link.bandwidth * 1000000) / loadInfo.totalRequest;
-            loadInfo.flows.forEach(flow => {
-                const limitedRate = flow.rate * ratio;
-                if (limitedRate < flow.actualRate) {
-                    flow.actualRate = limitedRate;
-                }
-            });
-            
+        const totalBw = link.bandwidth * 1000000;
+        const reservationRatio = link.reservationRatio || 0;
+        const reservedBw = totalBw * reservationRatio / 100;
+        const bestEffortBw = totalBw - reservedBw;
+
+        let reservedCongested = false;
+        let bestEffortCongested = false;
+
+        if (reservationRatio > 0 && reservedBw > 0) {
+            const reservedLoadRatio = loadInfo.priorityRequest / reservedBw;
+            if (reservedLoadRatio > 1) {
+                reservedCongested = true;
+                const ratio = reservedBw / loadInfo.priorityRequest;
+                loadInfo.priorityFlows.forEach(flow => {
+                    const limitedRate = flow.rate * ratio;
+                    if (limitedRate < flow.actualRate) {
+                        flow.actualRate = limitedRate;
+                    }
+                });
+            }
+        }
+
+        if (bestEffortBw > 0) {
+            const bestEffortLoadRatio = loadInfo.normalRequest / bestEffortBw;
+            if (bestEffortLoadRatio > 1) {
+                bestEffortCongested = true;
+                const ratio = bestEffortBw / loadInfo.normalRequest;
+                loadInfo.normalFlows.forEach(flow => {
+                    const limitedRate = flow.rate * ratio;
+                    if (limitedRate < flow.actualRate) {
+                        flow.actualRate = limitedRate;
+                    }
+                });
+            }
+        }
+
+        const isCongested = reservedCongested || bestEffortCongested;
+        if (isCongested) {
             if (!congestionStates.has(link.id)) {
                 congestionStates.set(link.id, {
                     startTime: Date.now(),
-                    packetLossActive: false
+                    packetLossActive: false,
+                    reservedCongested: reservedCongested,
+                    bestEffortCongested: bestEffortCongested
                 });
             } else {
                 const state = congestionStates.get(link.id);
+                state.reservedCongested = reservedCongested;
+                state.bestEffortCongested = bestEffortCongested;
                 if (Date.now() - state.startTime > 3000) {
                     state.packetLossActive = true;
                 }
@@ -1208,6 +1370,7 @@ function animate(timestamp) {
     checkFlowCompletion();
     updateLinkCongestion();
     updateTrafficProgress();
+    updateQoSStatsPanel();
     
     render();
     
@@ -1385,11 +1548,23 @@ function drawLink(link) {
     const midX = (from.x + to.x) / 2;
     const midY = (from.y + to.y) / 2;
     
+    const reservationRatio = link.reservationRatio || 0;
+    let label;
+    if (isDisabled) {
+        label = '已禁用';
+    } else if (reservationRatio > 0) {
+        const reservedLoad = getReservedPoolLoad(link.id);
+        const bestEffortLoad = getBestEffortPoolLoad(link.id);
+        label = `${link.bandwidth}Mbps R:${(reservedLoad * 100).toFixed(0)}% B:${(bestEffortLoad * 100).toFixed(0)}%`;
+    } else {
+        const loadRatio = getLinkLoad(link.id);
+        label = `${link.bandwidth}Mbps/${link.delay}ms ${(loadRatio * 100).toFixed(0)}%`;
+    }
+    
     ctx.fillStyle = '#fff';
     ctx.strokeStyle = isDisabled ? '#d9d9d9' : '#999';
     ctx.lineWidth = 1;
     
-    const label = isDisabled ? '已禁用' : `${link.bandwidth}Mbps/${link.delay}ms`;
     ctx.font = '10px -apple-system, sans-serif';
     const textWidth = ctx.measureText(label).width;
     
@@ -1400,6 +1575,24 @@ function drawLink(link) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(label, midX, midY);
+
+    if (!isDisabled && reservationRatio > 0) {
+        const reservedBw = link.bandwidth * reservationRatio / 100;
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+        const len = Math.sqrt(dx * dx + dy * dy) || 1;
+        const nx = -dy / len;
+        const ny = dx / len;
+        const offsetDist = 12;
+        const tagX = midX + nx * offsetDist;
+        const tagY = midY + ny * offsetDist;
+        
+        ctx.font = '9px -apple-system, sans-serif';
+        ctx.fillStyle = '#722ed1';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`预留${reservationRatio}%(${reservedBw}M)`, tagX, tagY);
+    }
 }
 
 function drawTemporaryLink() {
@@ -1438,9 +1631,12 @@ function drawPacket(packet) {
         return;
     }
     
-    ctx.fillStyle = '#1890ff';
+    const flow = trafficFlows.find(f => f.id === packet.flowId);
+    const isPriority = flow && flow.priority === 'priority';
+    
+    ctx.fillStyle = isPriority ? '#722ed1' : '#1890ff';
     ctx.beginPath();
-    ctx.arc(pos.x, pos.y, 4, 0, Math.PI * 2);
+    ctx.arc(pos.x, pos.y, isPriority ? 5 : 4, 0, Math.PI * 2);
     ctx.fill();
     
     ctx.strokeStyle = '#fff';
@@ -1470,6 +1666,7 @@ function setupUIEvents() {
         const dstId = parseInt(document.getElementById('dstDevice').value);
         const dataSize = parseFloat(document.getElementById('dataSize').value);
         const rate = parseFloat(document.getElementById('sendRate').value);
+        const priority = document.getElementById('trafficPriority').value;
         
         if (!srcId || !dstId) {
             alert('请选择源设备和目的设备');
@@ -1481,7 +1678,7 @@ function setupUIEvents() {
             return;
         }
         
-        injectTraffic(srcId, dstId, dataSize, rate);
+        injectTraffic(srcId, dstId, dataSize, rate, priority);
     });
     
     document.getElementById('routingDevice').addEventListener('change', updateRoutingTableDisplay);
@@ -1529,6 +1726,10 @@ function setupModalEvents() {
     
     document.getElementById('confirmLinkConfig').addEventListener('click', confirmLinkConfig);
     
+    document.getElementById('linkReservation').addEventListener('input', (e) => {
+        document.getElementById('linkReserveLabel').textContent = e.target.value + '%';
+    });
+    
     modal.addEventListener('click', (e) => {
         if (e.target === modal) {
             modal.classList.remove('show');
@@ -1542,6 +1743,8 @@ function showLinkConfigModal(fromDevice, toDevice) {
     pendingLinkConfig = { from: fromDevice, to: toDevice };
     document.getElementById('linkBandwidth').value = 100;
     document.getElementById('linkDelay').value = 10;
+    document.getElementById('linkReservation').value = 0;
+    document.getElementById('linkReserveLabel').textContent = '0%';
     document.getElementById('linkConfigModal').classList.add('show');
 }
 
@@ -1550,6 +1753,7 @@ function confirmLinkConfig() {
     
     const bandwidth = parseInt(document.getElementById('linkBandwidth').value);
     const delay = parseInt(document.getElementById('linkDelay').value);
+    const reservationRatio = parseInt(document.getElementById('linkReservation').value);
     
     if (bandwidth < 1 || bandwidth > 10000) {
         alert('带宽范围: 1-10000 Mbps');
@@ -1561,7 +1765,7 @@ function confirmLinkConfig() {
         return;
     }
     
-    addLink(pendingLinkConfig.from.id, pendingLinkConfig.to.id, bandwidth, delay);
+    addLink(pendingLinkConfig.from.id, pendingLinkConfig.to.id, bandwidth, delay, reservationRatio);
     
     document.getElementById('linkConfigModal').classList.remove('show');
     pendingLinkConfig = null;
@@ -1671,6 +1875,12 @@ function updatePropertyPanel() {
         const toDevice = devices.find(d => d.id === selectedLink.to);
         const loadRatio = (getLinkLoad(selectedLink.id) * 100).toFixed(1);
         const isEnabled = selectedLink.enabled;
+        const reservationRatio = selectedLink.reservationRatio || 0;
+        const reservedBw = (selectedLink.bandwidth * reservationRatio / 100).toFixed(0);
+        const bestEffortBw = (selectedLink.bandwidth * (100 - reservationRatio) / 100).toFixed(0);
+        const reservedLoad = reservationRatio > 0 ? (getReservedPoolLoad(selectedLink.id) * 100).toFixed(1) : '-';
+        const bestEffortLoad = reservationRatio > 0 ? (getBestEffortPoolLoad(selectedLink.id) * 100).toFixed(1) : '-';
+        const qosStats = getLinkQoSStats(selectedLink.id);
         
         panel.innerHTML = `
             <div class="prop-row">
@@ -1697,6 +1907,45 @@ function updatePropertyPanel() {
                 <span class="prop-label">当前负载</span>
                 <span class="prop-value">${isEnabled ? loadRatio + '%' : '-'}</span>
             </div>
+            <div class="prop-row qos-section-title">
+                <span class="prop-label" style="font-weight:500;color:#722ed1;">QoS带宽预留</span>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">预留比例</span>
+                <select id="propReservationRatio" class="prop-input" ${isEnabled ? '' : 'disabled'}>
+                    ${[0,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80].map(v => 
+                        `<option value="${v}" ${v === reservationRatio ? 'selected' : ''}>${v}%</option>`
+                    ).join('')}
+                </select>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">预留池带宽</span>
+                <span class="prop-value">${reservedBw} Mbps</span>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">尽力池带宽</span>
+                <span class="prop-value">${bestEffortBw} Mbps</span>
+            </div>
+            ${reservationRatio > 0 ? `
+            <div class="prop-row">
+                <span class="prop-label">预留池负载</span>
+                <span class="prop-value" style="color:${parseFloat(reservedLoad) > 85 ? '#ff4d4f' : '#333'}">${reservedLoad}%</span>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">尽力池负载</span>
+                <span class="prop-value" style="color:${parseFloat(bestEffortLoad) > 85 ? '#ff4d4f' : '#333'}">${bestEffortLoad}%</span>
+            </div>
+            ` : ''}
+            ${qosStats ? `
+            <div class="prop-row">
+                <span class="prop-label">优先流量</span>
+                <span class="prop-value">${qosStats.priorityCount}条 / ${qosStats.priorityRate.toFixed(1)}Mbps</span>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">普通流量</span>
+                <span class="prop-value">${qosStats.normalCount}条 / ${qosStats.normalRate.toFixed(1)}Mbps</span>
+            </div>
+            ` : ''}
             <div class="prop-row switch-row">
                 <span class="prop-label">链路状态</span>
                 <div class="switch ${isEnabled ? 'on' : 'off'}" id="linkSwitch">
@@ -1724,6 +1973,13 @@ function updatePropertyPanel() {
                 selectedLink.delay = val;
                 recalculateRoutes();
             }
+        });
+        
+        document.getElementById('propReservationRatio').addEventListener('change', (e) => {
+            const val = parseInt(e.target.value);
+            selectedLink.reservationRatio = val;
+            updatePropertyPanel();
+            updateLinkCongestion();
         });
         
         document.getElementById('linkSwitch').addEventListener('click', () => {
@@ -1831,10 +2087,12 @@ function updateTrafficList() {
         const statusText = flow.paused ? '等待恢复' : `${(flow.rate/1000000).toFixed(1)}Mbps`;
         const statusColor = flow.paused ? '#faad14' : '#999';
         const itemClass = flow.paused ? 'traffic-item paused' : 'traffic-item';
+        const priorityLabel = flow.priority === 'priority' ? '<span style="color:#722ed1;font-size:10px;">[优先]</span>' : '<span style="color:#999;font-size:10px;">[普通]</span>';
+        const demotedLabel = flow.demoted ? '<span style="color:#faad14;font-size:10px;">[已降级]</span>' : '';
         
         html += `<div class="${itemClass}">
             <div>
-                <div>${src?.name || '-'} → ${dst?.name || '-'}</div>
+                <div>${priorityLabel}${demotedLabel} ${src?.name || '-'} → ${dst?.name || '-'}</div>
                 <div style="font-size:11px;color:${statusColor};">${statusText}</div>
             </div>
             <div style="flex:1;margin-left:10px;">
@@ -1874,6 +2132,72 @@ function updateFaultStats() {
     if (totalFaultEl) totalFaultEl.textContent = faultStats.totalFaultCount;
     if (pathSwitchEl) pathSwitchEl.textContent = faultStats.pathSwitchCount;
     if (pausedFlowEl) pausedFlowEl.textContent = faultStats.pausedFlowCount;
+}
+
+function updateQoSStatsPanel() {
+    const container = document.getElementById('qosStatsContent');
+    if (!container) return;
+
+    if (links.length === 0) {
+        container.innerHTML = '<p class="hint">暂无链路数据</p>';
+        return;
+    }
+
+    let html = '';
+    links.forEach(link => {
+        if (!link.enabled) return;
+        const from = devices.find(d => d.id === link.from);
+        const to = devices.find(d => d.id === link.to);
+        const reservationRatio = link.reservationRatio || 0;
+        const qosStats = getLinkQoSStats(link.id);
+
+        if (!qosStats && reservationRatio === 0) return;
+
+        const reservedBw = (link.bandwidth * reservationRatio / 100).toFixed(0);
+        const bestEffortBw = (link.bandwidth * (100 - reservationRatio) / 100).toFixed(0);
+
+        html += `<div class="qos-link-item">
+            <div class="qos-link-header">
+                <span class="qos-link-name">${from?.name || '?'} - ${to?.name || '?'}</span>
+                <span class="qos-link-bw">${link.bandwidth}Mbps</span>
+            </div>`;
+
+        if (reservationRatio > 0) {
+            const reservedUsage = qosStats ? qosStats.reservedPoolUsage.toFixed(1) : '0.0';
+            const bestEffortUsage = qosStats ? qosStats.bestEffortPoolUsage.toFixed(1) : '0.0';
+            html += `<div class="qos-pool-row">
+                <span class="qos-pool-label qos-reserved">预留池</span>
+                <span class="qos-pool-bw">${reservedBw}M</span>
+                <div class="qos-pool-bar">
+                    <div class="qos-pool-bar-fill qos-reserved-fill" style="width:${Math.min(100, parseFloat(reservedUsage))}%"></div>
+                </div>
+                <span class="qos-pool-pct">${reservedUsage}%</span>
+            </div>
+            <div class="qos-pool-row">
+                <span class="qos-pool-label qos-besteffort">尽力池</span>
+                <span class="qos-pool-bw">${bestEffortBw}M</span>
+                <div class="qos-pool-bar">
+                    <div class="qos-pool-bar-fill qos-besteffort-fill" style="width:${Math.min(100, parseFloat(bestEffortUsage))}%"></div>
+                </div>
+                <span class="qos-pool-pct">${bestEffortUsage}%</span>
+            </div>`;
+        } else {
+            html += `<div class="qos-pool-row">
+                <span class="qos-pool-label">未配置预留</span>
+            </div>`;
+        }
+
+        if (qosStats) {
+            html += `<div class="qos-flow-counts">
+                <span class="qos-priority-count">优先: ${qosStats.priorityCount}条</span>
+                <span class="qos-normal-count">普通: ${qosStats.normalCount}条</span>
+            </div>`;
+        }
+
+        html += `</div>`;
+    });
+
+    container.innerHTML = html || '<p class="hint">暂无QoS配置</p>';
 }
 
 function updatePartitionPanel() {
@@ -1977,7 +2301,8 @@ function exportTopology() {
             to: l.to,
             bandwidth: l.bandwidth,
             delay: l.delay,
-            enabled: l.enabled
+            enabled: l.enabled,
+            reservationRatio: l.reservationRatio || 0
         })),
         manualRoutes: manualRoutes
     };
@@ -2013,7 +2338,8 @@ function importTopology(e) {
             devices = data.devices.map(d => ({ ...d }));
             links = data.links.map(l => ({ 
                 ...l, 
-                enabled: l.enabled !== undefined ? l.enabled : true 
+                enabled: l.enabled !== undefined ? l.enabled : true,
+                reservationRatio: l.reservationRatio || 0
             }));
             manualRoutes = data.manualRoutes || [];
             
@@ -2247,6 +2573,7 @@ function addEventToScenario() {
     const dstId = parseInt(document.getElementById('eventDst').value);
     const dataSize = parseFloat(document.getElementById('eventDataSize').value);
     const rate = parseFloat(document.getElementById('eventRate').value);
+    const priority = document.getElementById('eventPriority').value;
 
     if (isNaN(time) || time < 0) {
         alert('请输入有效的触发时刻');
@@ -2276,6 +2603,7 @@ function addEventToScenario() {
         dstId: dstId,
         dataSize: dataSize,
         rate: rate,
+        priority: priority || 'normal',
         triggered: false,
         flowId: null
     };
@@ -2311,13 +2639,14 @@ function renderEventList() {
         const src = devices.find(d => d.id === e.srcId);
         const dst = devices.find(d => d.id === e.dstId);
         const isRunning = currentRunningScenario !== null;
+        const priorityLabel = e.priority === 'priority' ? '<span style="color:#722ed1;font-size:10px;">[优先]</span>' : '';
         html += `<div class="event-item">
             <div class="event-item-header">
                 <span class="event-item-time">T+${e.time.toFixed(1)}s</span>
                 ${isRunning ? '' : `<span class="event-item-delete" onclick="deleteEvent(${e.id})">×</span>`}
             </div>
             <div class="event-item-detail">
-                ${src?.name || '-'} → ${dst?.name || '-'}<br>
+                ${priorityLabel}${src?.name || '-'} → ${dst?.name || '-'}<br>
                 ${e.dataSize}KB @ ${e.rate}Mbps
             </div>
         </div>`;
@@ -2391,7 +2720,7 @@ function scenarioTick() {
                     failedReason: 'cross_partition'
                 });
             } else {
-                const success = injectTraffic(event.srcId, event.dstId, event.dataSize, event.rate);
+                const success = injectTraffic(event.srcId, event.dstId, event.dataSize, event.rate, event.priority || 'normal');
                 if (success) {
                     const flow = trafficFlows[trafficFlows.length - 1];
                     if (flow) {
@@ -2428,9 +2757,14 @@ function scenarioSample() {
             scenarioLinkSamples.set(link.id, []);
         }
         const load = getLinkRequestedLoad(link.id);
+        const reservationRatio = link.reservationRatio || 0;
+        const reservedPoolLoad = reservationRatio > 0 ? getReservedPoolLoad(link.id) : 0;
+        const bestEffortPoolLoad = reservationRatio > 0 ? getBestEffortPoolLoad(link.id) : load;
         scenarioLinkSamples.get(link.id).push({
             time: Math.round(sampleTime * 10) / 10,
-            load: load
+            load: load,
+            reservedPoolLoad: reservedPoolLoad,
+            bestEffortPoolLoad: bestEffortPoolLoad
         });
     });
 }
@@ -2547,6 +2881,8 @@ function recordFlowCompletion(flow) {
         dstId: event.dstId,
         dataSize: event.dataSize,
         rate: event.rate,
+        priority: flow.priority || 'normal',
+        demoted: flow.demoted || false,
         duration: duration,
         lossRate: lossRate,
         linkIds: linkIds,
@@ -2579,6 +2915,12 @@ function generateReport(aborted = false) {
         const congestedSamples = loads.filter(l => l > 1.0).length;
         const congestedDuration = congestedSamples * 0.1;
 
+        const reservationRatio = link.reservationRatio || 0;
+        const reservedPoolLoads = samples.map(s => s.reservedPoolLoad || 0);
+        const bestEffortPoolLoads = samples.map(s => s.bestEffortPoolLoad || 0);
+        const peakReservedPoolLoad = reservedPoolLoads.length > 0 ? Math.max(...reservedPoolLoads) : 0;
+        const peakBestEffortPoolLoad = bestEffortPoolLoads.length > 0 ? Math.max(...bestEffortPoolLoads) : 0;
+
         const flowsOnLink = scenarioFlowResults.filter(r => 
             !r.failed && r.linkIds && r.linkIds.includes(link.id)
         );
@@ -2590,11 +2932,14 @@ function generateReport(aborted = false) {
             linkId: link.id,
             linkName: `${getDeviceName(link.from)} - ${getDeviceName(link.to)}`,
             bandwidth: link.bandwidth,
+            reservationRatio: reservationRatio,
             peakLoad: peakLoad,
             avgLoad: avgLoad,
             congestedDuration: congestedDuration,
             lossRate: linkLossRate,
             flowCount: flowsOnLink.length,
+            peakReservedPoolLoad: peakReservedPoolLoad,
+            peakBestEffortPoolLoad: peakBestEffortPoolLoad,
             samples: samples
         });
     });
@@ -2610,6 +2955,8 @@ function generateReport(aborted = false) {
                 src: getDeviceName(result.srcId),
                 dst: getDeviceName(result.dstId),
                 rate: result.rate,
+                priority: result.priority || 'normal',
+                demoted: result.demoted || false,
                 duration: result.duration,
                 lossRate: result.lossRate,
                 path: result.path,
@@ -2698,6 +3045,15 @@ function renderReport() {
             if (ls.peakLoad > 1.0) barColor = '#ff4d4f';
             else if (ls.peakLoad > 0.6) barColor = '#faad14';
             
+            const reservationRatio = ls.reservationRatio || 0;
+            let poolInfo = '';
+            if (reservationRatio > 0) {
+                const reservedPeak = (ls.peakReservedPoolLoad * 100).toFixed(1);
+                const bestEffortPeak = (ls.peakBestEffortPoolLoad * 100).toFixed(1);
+                poolInfo = `<span style="color:#722ed1;">预留池峰值: ${reservedPeak}%</span>
+                            <span style="color:#fa8c16;">尽力池峰值: ${bestEffortPeak}%</span>`;
+            }
+            
             html += `<div class="report-link-item" style="display:block;">
                 <div style="display:flex;justify-content:space-between;align-items:center;">
                     <span class="report-link-name">${escapeHtml(ls.linkName)}</span>
@@ -2707,6 +3063,7 @@ function renderReport() {
                         <span>拥塞: ${ls.congestedDuration.toFixed(1)}s</span>
                     </span>
                 </div>
+                ${poolInfo ? `<div class="report-link-pool-stats">${poolInfo}</div>` : ''}
                 <div class="report-link-bar">
                     <div class="report-link-bar-fill" style="width:${peakPercent}%;background:${barColor};"></div>
                 </div>
@@ -2732,9 +3089,11 @@ function renderReport() {
                     statusText = '已中止';
                 }
             }
+            const priorityLabel = fd.priority === 'priority' ? '<span style="color:#722ed1;font-size:10px;">[优先]</span>' : '<span style="color:#999;font-size:10px;">[普通]</span>';
+            const demotedLabel = fd.demoted ? '<span style="color:#faad14;font-size:10px;">[已降级]</span>' : '';
             html += `<div class="report-flow-item">
                 <div class="report-flow-item-header">
-                    <span class="report-flow-name">T+${fd.time.toFixed(1)}s ${escapeHtml(fd.src)} → ${escapeHtml(fd.dst)}</span>
+                    <span class="report-flow-name">${priorityLabel}${demotedLabel} T+${fd.time.toFixed(1)}s ${escapeHtml(fd.src)} → ${escapeHtml(fd.dst)}</span>
                     <span class="report-flow-status ${statusClass}">${statusText}</span>
                 </div>
                 <div class="report-flow-detail">
@@ -2843,7 +3202,7 @@ async function saveTopology() {
         method: 'POST',
         body: JSON.stringify({
             devices: devices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
-            links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled })),
+            links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled, reservationRatio: l.reservationRatio || 0 })),
             manualRoutes: manualRoutes,
             name: name
         })
@@ -2920,7 +3279,7 @@ async function loadSelectedVersion() {
 
 function applyTopologyData(data) {
     devices = data.devices.map(d => ({ ...d }));
-    links = data.links.map(l => ({ ...l, enabled: l.enabled !== undefined ? l.enabled : true }));
+    links = data.links.map(l => ({ ...l, enabled: l.enabled !== undefined ? l.enabled : true, reservationRatio: l.reservationRatio || 0 }));
     manualRoutes = data.manualRoutes || [];
 
     deviceIdCounter = Math.max(...devices.map(d => d.id), 0) + 1;
@@ -2952,7 +3311,7 @@ function applyTopologyData(data) {
 async function saveReportToBackend(reportData) {
     const topologySnapshot = {
         devices: devices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
-        links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled })),
+        links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled, reservationRatio: l.reservationRatio || 0 })),
         manualRoutes: manualRoutes
     };
 
@@ -2980,7 +3339,7 @@ async function saveReportToBackend(reportData) {
 async function savePartitionChangeToBackend(event) {
     const topologySnapshot = {
         devices: devices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
-        links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled })),
+        links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled, reservationRatio: l.reservationRatio || 0 })),
         manualRoutes: manualRoutes
     };
 
@@ -3590,7 +3949,7 @@ async function saveConfigToBackend(configData, parsedDevices, parsedLinks) {
         body: JSON.stringify({
             configData,
             parsedDevices: parsedDevices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
-            parsedLinks: parsedLinks.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled }))
+            parsedLinks: parsedLinks.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled, reservationRatio: l.reservationRatio || 0 }))
         })
     });
 
@@ -3637,7 +3996,7 @@ function runAudit() {
         alerts: alerts,
         topologySnapshot: {
             devices: devices.map(d => ({ id: d.id, type: d.type, name: d.name, x: d.x, y: d.y })),
-            links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled }))
+            links: links.map(l => ({ id: l.id, from: l.from, to: l.to, bandwidth: l.bandwidth, delay: l.delay, enabled: l.enabled, reservationRatio: l.reservationRatio || 0 }))
         }
     };
 
