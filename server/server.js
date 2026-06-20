@@ -24,7 +24,9 @@ const {
   listTrafficRecordings,
   getTrafficRecording,
   deleteTrafficRecording,
-  compareTrafficRecordings
+  compareTrafficRecordings,
+  saveSlaEvent,
+  listSlaEvents
 } = require('./database');
 
 const app = express();
@@ -448,6 +450,46 @@ app.get('/api/recordings/compare/:id1/:id2', async (req, res) => {
   } catch (err) {
     console.error('对比流量录制失败:', err);
     res.status(500).json({ error: '对比失败' });
+  }
+});
+
+app.post('/api/sla/events', async (req, res) => {
+  try {
+    const eventData = req.body;
+
+    if (!eventData.contractName || !eventData.eventType) {
+      return res.status(400).json({ error: '缺少必要字段: contractName, eventType' });
+    }
+
+    const result = await saveSlaEvent(eventData);
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存SLA事件失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/sla/events', async (req, res) => {
+  try {
+    const filters = {
+      contractName: req.query.contractName || null,
+      startTime: req.query.startTime || null,
+      endTime: req.query.endTime || null,
+      limit: req.query.limit || 100
+    };
+
+    const events = await listSlaEvents(filters);
+    res.json({
+      success: true,
+      data: events
+    });
+  } catch (err) {
+    console.error('获取SLA事件列表失败:', err);
+    res.status(500).json({ error: '获取失败' });
   }
 });
 

@@ -121,6 +121,28 @@ function initDatabase() {
       db.run(`
         CREATE INDEX IF NOT EXISTS idx_traffic_recordings_created 
         ON traffic_recordings(created_at DESC)
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS sla_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contract_name TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          breach_types TEXT NOT NULL,
+          root_cause_link TEXT,
+          duration REAL NOT NULL DEFAULT 0,
+          timestamp INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_sla_events_timestamp 
+        ON sla_events(timestamp DESC)
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_sla_events_contract_name 
+        ON sla_events(contract_name)
       `, (err) => {
         if (err) reject(err);
         else resolve();
@@ -914,6 +936,63 @@ async function compareTrafficRecordings(recordingId1, recordingId2) {
   };
 }
 
+function saveSlaEvent(eventData) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`
+      INSERT INTO sla_events (contract_name, event_type, breach_types, root_cause_link, duration, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      eventData.contractName,
+      eventData.eventType,
+      JSON.stringify(eventData.breachTypes || []),
+      eventData.rootCauseLink || null,
+      eventData.duration || 0,
+      eventData.timestamp || Date.now(),
+      function(err) {
+        if (err) return reject(err);
+        resolve({ id: this.lastID, timestamp: eventData.timestamp || Date.now() });
+      }
+    );
+  });
+}
+
+function listSlaEvents(filters) {
+  return new Promise((resolve, reject) => {
+    let sql = 'SELECT * FROM sla_events WHERE 1=1';
+    const params = [];
+
+    if (filters.contractName) {
+      sql += ' AND contract_name = ?';
+      params.push(filters.contractName);
+    }
+    if (filters.startTime) {
+      sql += ' AND timestamp >= ?';
+      params.push(parseInt(filters.startTime));
+    }
+    if (filters.endTime) {
+      sql += ' AND timestamp <= ?';
+      params.push(parseInt(filters.endTime));
+    }
+
+    sql += ' ORDER BY timestamp DESC LIMIT ?';
+    params.push(parseInt(filters.limit) || 100);
+
+    db.all(sql, params, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        contractName: row.contract_name,
+        eventType: row.event_type,
+        breachTypes: JSON.parse(row.breach_types),
+        rootCauseLink: row.root_cause_link,
+        duration: row.duration,
+        timestamp: row.timestamp
+      })));
+    });
+  });
+}
+
 module.exports = {
   initDatabase,
   saveTopology,
@@ -936,5 +1015,7 @@ module.exports = {
   listTrafficRecordings,
   getTrafficRecording,
   deleteTrafficRecording,
-  compareTrafficRecordings
+  compareTrafficRecordings,
+  saveSlaEvent,
+  listSlaEvents
 };

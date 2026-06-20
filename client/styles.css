@@ -2107,3 +2107,298 @@ body {
     font-size: 10px;
 }
 
+.sla-panel {
+    font-size: 13px;
+}
+
+.sla-create-form {
+    background: #f5f7fa;
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 10px;
+    margin-bottom: 10px;
+}
+
+.sla-thresholds {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 6px;
+}
+
+.sla-thresholds .form-group {
+    margin-bottom: 0;
+}
+
+.sla-thresholds .form-group input {
+    font-size: 12px;
+    padding: 4px 6px;
+}
+
+.sla-contract-header {
+    font-size: 12px;
+    color: #666;
+    font-weight: 500;
+    margin-bottom: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #eee;
+}
+
+.sla-contract-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 400px;
+    overflow-y: auto;
+    margin-bottom: 10px;
+}
+
+.sla-contract-item {
+    padding: 8px 10px;
+    background: #f5f7fa;
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    border-left: 4px solid #52c41a;
+    transition: all 0.2s;
+}
+
+.sla-contract-item.violating {
+    border-left-color: #ff4d4f;
+    background: #fff1f0;
+    border-color: #ffa39e;
+    border-left-color: #ff4d4f;
+}
+
+.sla-contract-item-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 4px;
+}
+
+.sla-contract-name {
+    font-weight: 500;
+    color: #333;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.sla-status-icon {
+    font-size: 14px;
+    line-height: 1;
+}
+
+.sla-status-icon.compliant {
+    color: #52c41a;
+}
+
+.sla-status-icon.violating {
+    color: #ff4d4f;
+}
+
+.sla-contract-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.sla-contract-actions button {
+    padding: 2px 8px;
+    font-size: 11px;
+    border: 1px solid #d9d9d9;
+    background: #fff;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.sla-contract-actions button:hover {
+    border-color: #1890ff;
+    color: #1890ff;
+}
+
+.sla-contract-actions .sla-delete-btn:hover {
+    border-color: #ff4d4f;
+    color: #ff4d4f;
+}
+
+.sla-contract-path {
+    font-size: 11px;
+    color: #999;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sla-contract-metrics {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 11px;
+}
+
+.sla-metric {
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: #e8e8e8;
+    color: #666;
+}
+
+.sla-metric.breach {
+    background: #fff1f0;
+    color: #ff4d4f;
+    border: 1px solid #ffa39e;
+}
+
+.sla-metric.ok {
+    background: #f6ffed;
+    color: #52c41a;
+    border: 1px solid #b7eb8f;
+}
+
+.sla-contract-detail {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed #e0e0e0;
+    font-size: 11px;
+}
+
+.sla-root-cause {
+    padding: 4px 8px;
+    background: #fff1f0;
+    border: 1px solid #ffa39e;
+    border-radius: 3px;
+    margin-top: 4px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.sla-root-cause:hover {
+    background: #ffe7e6;
+}
+
+.sla-root-cause-title {
+    font-weight: 500;
+    color: #cf1322;
+    margin-bottom: 2px;
+}
+
+.sla-root-cause-detail {
+    color: #666;
+}
+
+.sla-latency-breakdown {
+    margin-top: 4px;
+}
+
+.sla-latency-bar {
+    display: flex;
+    height: 8px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: #e0e0e0;
+    margin-top: 2px;
+}
+
+.sla-latency-segment {
+    height: 100%;
+    transition: width 0.3s;
+}
+
+.sla-event-section {
+    border-top: 1px solid #eee;
+    padding-top: 8px;
+    margin-bottom: 10px;
+}
+
+.sla-event-header {
+    font-size: 12px;
+    color: #666;
+    font-weight: 500;
+    margin-bottom: 6px;
+}
+
+.sla-event-list {
+    max-height: 250px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.sla-event-item {
+    padding: 6px 8px;
+    background: #f5f7fa;
+    border-radius: 4px;
+    font-size: 11px;
+    border-left: 3px solid #1890ff;
+}
+
+.sla-event-item.violation {
+    border-left-color: #ff4d4f;
+}
+
+.sla-event-item.recovery {
+    border-left-color: #52c41a;
+}
+
+.sla-event-time {
+    color: #999;
+    font-size: 10px;
+    margin-bottom: 2px;
+}
+
+.sla-event-detail {
+    color: #333;
+    line-height: 1.3;
+}
+
+.sla-event-cause {
+    color: #666;
+    font-size: 10px;
+    margin-top: 2px;
+}
+
+.sla-report-section {
+    border-top: 1px solid #eee;
+    padding-top: 8px;
+}
+
+.sla-report-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+}
+
+.sla-report-table th,
+.sla-report-table td {
+    padding: 4px 6px;
+    border: 1px solid #e8e8e8;
+    text-align: left;
+}
+
+.sla-report-table th {
+    background: #f5f7fa;
+    font-weight: 500;
+    color: #666;
+}
+
+.sla-report-table td {
+    color: #333;
+}
+
+.sla-report-export {
+    margin-top: 8px;
+    display: flex;
+    justify-content: flex-end;
+}
+
+.sla-blink-link {
+    animation: slaBlink 0.5s ease-in-out 10;
+}
+
+@keyframes slaBlink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.2; }
+}
+

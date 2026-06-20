@@ -5465,6 +5465,7 @@ init = function() {
     setupBackendEvents();
     setupConfigAuditEvents();
     setupTrafficRecordingEvents();
+    setupSlaEvents();
     loadTopologyVersions();
     loadTrafficRecordings();
 
@@ -5473,6 +5474,700 @@ init = function() {
     } else {
         showAuditEmpty();
     }
+};
+
+let slaContracts = [];
+let slaContractIdCounter = 1;
+let slaMonitorTimer = null;
+let slaViolationEvents = [];
+let slaBlinkLinks = new Map();
+let slaContractStats = new Map();
+let slaEditingContractId = null;
+const SLA_MAX_CONTRACTS = 20;
+const SLA_MONITOR_INTERVAL = 500;
+const SLA_MAX_EVENTS_DISPLAY = 20;
+
+function setupSlaEvents() {
+    document.getElementById('slaCreateBtn').addEventListener('click', createSlaContract);
+    document.getElementById('slaEditBtn').addEventListener('click', saveSlaEdit);
+    document.getElementById('slaCancelEditBtn').addEventListener('click', cancelSlaEdit);
+    document.getElementById('slaGenerateReportBtn').addEventListener('click', generateSlaReport);
+
+    const origUpdateDeviceSelects = updateDeviceSelects;
+    updateDeviceSelects = function() {
+        origUpdateDeviceSelects();
+        updateSlaDeviceSelects();
+    };
+}
+
+function updateSlaDeviceSelects() {
+    const selects = ['slaSrcDevice', 'slaDstDevice'];
+    selects.forEach(selectId => {
+        const select = document.getElementById(selectId);
+        if (!select) return;
+        const currentValue = select.value;
+        select.innerHTML = '<option value="">请选择</option>';
+        devices.forEach(d => {
+            const option = document.createElement('option');
+            option.value = d.id;
+            option.textContent = d.name;
+            select.appendChild(option);
+        });
+        if (currentValue && devices.find(d => d.id == currentValue)) {
+            select.value = currentValue;
+        }
+    });
+}
+
+function createSlaContract() {
+    if (slaContracts.length >= SLA_MAX_CONTRACTS) {
+        alert(`SLA合约数量已达上限（${SLA_MAX_CONTRACTS}条）`);
+        return;
+    }
+
+    const name = document.getElementById('slaName').value.trim();
+    const srcId = parseInt(document.getElementById('slaSrcDevice').value);
+    const dstId = parseInt(document.getElementById('slaDstDevice').value);
+    const maxLatency = parseFloat(document.getElementById('slaMaxLatency').value);
+    const maxLossRate = parseFloat(document.getElementById('slaMaxLossRate').value);
+    const minBandwidth = parseFloat(document.getElementById('slaMinBandwidth').value);
+
+    if (!name) { alert('请输入合约名称'); return; }
+    if (!srcId || !dstId) { alert('请选择源设备和目的设备'); return; }
+    if (srcId === dstId) { alert('源设备和目的设备不能相同'); return; }
+    if (isNaN(maxLatency) || maxLatency <= 0) { alert('最大延迟必须大于0'); return; }
+    if (isNaN(maxLossRate) || maxLossRate < 0 || maxLossRate > 100) { alert('最大丢包率范围0-100'); return; }
+    if (isNaN(minBandwidth) || minBandwidth <= 0) { alert('最低带宽必须大于0'); return; }
+
+    const path = getPath(srcId, dstId);
+    if (!path) {
+        alert('源到目的不可达，无法创建SLA合约');
+        return;
+    }
+
+    const contract = {
+        id: slaContractIdCounter++,
+        name,
+        srcDeviceId: srcId,
+        dstDeviceId: dstId,
+        maxLatency,
+        maxLossRate,
+        minBandwidth,
+        path,
+        isViolating: false,
+        violationTypes: [],
+        rootCauses: [],
+        monitoring: true,
+        createdAt: Date.now(),
+        violationStartTime: null
+    };
+
+    slaContracts.push(contract);
+    slaContractStats.set(contract.id, {
+        complianceMs: 0,
+        violationMs: 0,
+        violationCount: 0,
+        violationDurations: [],
+        rootCauseLinks: []
+    });
+
+    document.getElementById('slaName').value = '';
+    startSlaMonitor();
+    renderSlaContractList();
+    addLog(`SLA合约已创建: ${name}`, 'success');
+}
+
+function editSlaContract(contractId) {
+    const contract = slaContracts.find(c => c.id === contractId);
+    if (!contract) return;
+
+    slaEditingContractId = contractId;
+    document.getElementById('slaName').value = contract.name;
+    document.getElementById('slaSrcDevice').value = contract.srcDeviceId;
+    document.getElementById('slaDstDevice').value = contract.dstDeviceId;
+    document.getElementById('slaMaxLatency').value = contract.maxLatency;
+    document.getElementById('slaMaxLossRate').value = contract.maxLossRate;
+    document.getElementById('slaMinBandwidth').value = contract.minBandwidth;
+
+    document.getElementById('slaCreateBtn').style.display = 'none';
+    document.getElementById('slaEditBtn').style.display = 'inline-block';
+    document.getElementById('slaCancelEditBtn').style.display = 'inline-block';
+}
+
+function saveSlaEdit() {
+    if (!slaEditingContractId) return;
+    const contract = slaContracts.find(c => c.id === slaEditingContractId);
+    if (!contract) return;
+
+    const name = document.getElementById('slaName').value.trim();
+    const srcId = parseInt(document.getElementById('slaSrcDevice').value);
+    const dstId = parseInt(document.getElementById('slaDstDevice').value);
+    const maxLatency = parseFloat(document.getElementById('slaMaxLatency').value);
+    const maxLossRate = parseFloat(document.getElementById('slaMaxLossRate').value);
+    const minBandwidth = parseFloat(document.getElementById('slaMinBandwidth').value);
+
+    if (!name) { alert('请输入合约名称'); return; }
+    if (!srcId || !dstId) { alert('请选择源设备和目的设备'); return; }
+    if (srcId === dstId) { alert('源设备和目的设备不能相同'); return; }
+
+    contract.name = name;
+    contract.srcDeviceId = srcId;
+    contract.dstDeviceId = dstId;
+    contract.maxLatency = maxLatency;
+    contract.maxLossRate = maxLossRate;
+    contract.minBandwidth = minBandwidth;
+
+    const newPath = getPath(srcId, dstId);
+    contract.path = newPath;
+    if (!newPath) {
+        addLog(`SLA合约 ${name} 路径不可达`, 'warning');
+    }
+
+    cancelSlaEdit();
+    renderSlaContractList();
+    addLog(`SLA合约已更新: ${name}`, 'success');
+}
+
+function cancelSlaEdit() {
+    slaEditingContractId = null;
+    document.getElementById('slaName').value = '';
+    document.getElementById('slaCreateBtn').style.display = 'inline-block';
+    document.getElementById('slaEditBtn').style.display = 'none';
+    document.getElementById('slaCancelEditBtn').style.display = 'none';
+}
+
+function deleteSlaContract(contractId) {
+    const contract = slaContracts.find(c => c.id === contractId);
+    if (!contract) return;
+
+    if (contract.monitoring) {
+        if (!confirm(`合约"${contract.name}"正在监控中，确定要删除吗？`)) return;
+    }
+
+    slaContracts = slaContracts.filter(c => c.id !== contractId);
+    slaContractStats.delete(contractId);
+
+    if (slaContracts.length === 0) {
+        stopSlaMonitor();
+    }
+
+    if (slaEditingContractId === contractId) {
+        cancelSlaEdit();
+    }
+
+    renderSlaContractList();
+    addLog(`SLA合约已删除: ${contract.name}`, 'info');
+}
+
+function startSlaMonitor() {
+    if (slaMonitorTimer) return;
+    slaMonitorTimer = setInterval(slaMonitorTick, SLA_MONITOR_INTERVAL);
+}
+
+function stopSlaMonitor() {
+    if (slaContracts.length > 0) return;
+    if (slaMonitorTimer) {
+        clearInterval(slaMonitorTimer);
+        slaMonitorTimer = null;
+    }
+}
+
+function slaMonitorTick() {
+    slaContracts.forEach(contract => {
+        if (!contract.monitoring) return;
+
+        contract.path = getPath(contract.srcDeviceId, contract.dstDeviceId);
+
+        const stats = slaContractStats.get(contract.id);
+        if (!stats) return;
+
+        if (!contract.path || !contract.path.segments || contract.path.segments.length === 0) {
+            const wasViolating = contract.isViolating;
+            contract.isViolating = true;
+            contract.violationTypes = ['unreachable'];
+            contract.rootCauses = [{ type: 'unreachable', linkId: null, linkName: '无可用路径', details: '源到目的不可达' }];
+            if (!wasViolating) {
+                recordSlaViolationEvent(contract);
+                contract.violationStartTime = Date.now();
+            }
+            stats.violationMs += SLA_MONITOR_INTERVAL;
+            return;
+        }
+
+        const metrics = calculateSlaMetrics(contract);
+        const result = evaluateSlaCompliance(contract, metrics);
+
+        const wasViolating = contract.isViolating;
+        contract.isViolating = result.isViolating;
+        contract.violationTypes = result.violationTypes;
+        contract.rootCauses = result.rootCauses;
+        contract.currentMetrics = metrics;
+
+        if (result.isViolating) {
+            stats.violationMs += SLA_MONITOR_INTERVAL;
+            if (!wasViolating) {
+                stats.violationCount++;
+                contract.violationStartTime = Date.now();
+                recordSlaViolationEvent(contract);
+            }
+            result.rootCauses.forEach(rc => {
+                if (rc.linkId) {
+                    stats.rootCauseLinks.push(rc.linkId);
+                }
+            });
+        } else {
+            stats.complianceMs += SLA_MONITOR_INTERVAL;
+            if (wasViolating) {
+                const duration = contract.violationStartTime ? Date.now() - contract.violationStartTime : 0;
+                stats.violationDurations.push(duration);
+                recordSlaRecoveryEvent(contract, duration);
+                contract.violationStartTime = null;
+            }
+        }
+    });
+
+    slaBlinkLinks.forEach((info, linkId) => {
+        if (Date.now() - info.startTime > 5000) {
+            slaBlinkLinks.delete(linkId);
+        }
+    });
+
+    renderSlaContractList();
+}
+
+function calculateSlaMetrics(contract) {
+    const path = contract.path;
+    if (!path || !path.segments || path.segments.length === 0) {
+        return { latency: Infinity, lossRate: 100, availableBandwidth: 0 };
+    }
+
+    let latency = 0;
+    path.segments.forEach(seg => {
+        latency += seg.link.delay;
+    });
+
+    let passThroughProduct = 1;
+    path.segments.forEach(seg => {
+        const congestionState = congestionStates.get(seg.link.id);
+        if (congestionState && congestionState.packetLossActive) {
+            passThroughProduct *= (1 - 0.2);
+        }
+    });
+    const lossRate = (1 - passThroughProduct) * 100;
+
+    let availableBandwidth = Infinity;
+    path.segments.forEach(seg => {
+        const link = seg.link;
+        const currentLoad = getLinkLoad(link.id);
+        const usedBw = currentLoad * link.bandwidth;
+        const remaining = link.bandwidth - usedBw;
+        if (remaining < availableBandwidth) {
+            availableBandwidth = remaining;
+        }
+    });
+
+    return { latency, lossRate, availableBandwidth };
+}
+
+function evaluateSlaCompliance(contract, metrics) {
+    const violationTypes = [];
+    const rootCauses = [];
+    const path = contract.path;
+
+    if (metrics.latency > contract.maxLatency) {
+        violationTypes.push('latency');
+        let maxDelay = 0;
+        let maxDelayLink = null;
+        const breakdown = [];
+        path.segments.forEach(seg => {
+            breakdown.push({ linkId: seg.link.id, delay: seg.link.delay, name: getLinkDisplayName(seg.link.id) });
+            if (seg.link.delay > maxDelay) {
+                maxDelay = seg.link.delay;
+                maxDelayLink = seg.link;
+            }
+        });
+        rootCauses.push({
+            type: 'latency',
+            linkId: maxDelayLink ? maxDelayLink.id : null,
+            linkName: maxDelayLink ? getLinkDisplayName(maxDelayLink.id) : '未知',
+            details: `延迟${maxDelay}ms (占比${path.segments.length > 0 ? (maxDelay / metrics.latency * 100).toFixed(1) : 0}%)`,
+            breakdown
+        });
+    }
+
+    if (metrics.lossRate > contract.maxLossRate) {
+        violationTypes.push('loss_rate');
+        let congestedLink = null;
+        for (const seg of path.segments) {
+            const congestionState = congestionStates.get(seg.link.id);
+            if (congestionState && congestionState.packetLossActive) {
+                congestedLink = seg.link;
+                break;
+            }
+        }
+        rootCauses.push({
+            type: 'loss_rate',
+            linkId: congestedLink ? congestedLink.id : null,
+            linkName: congestedLink ? getLinkDisplayName(congestedLink.id) : '未知',
+            details: `丢包率${metrics.lossRate.toFixed(1)}% > 阈值${contract.maxLossRate}%`
+        });
+    }
+
+    if (metrics.availableBandwidth < contract.minBandwidth) {
+        violationTypes.push('bandwidth');
+        let minBwLink = null;
+        let minBw = Infinity;
+        path.segments.forEach(seg => {
+            const link = seg.link;
+            const currentLoad = getLinkLoad(link.id);
+            const remaining = link.bandwidth - currentLoad * link.bandwidth;
+            if (remaining < minBw) {
+                minBw = remaining;
+                minBwLink = link;
+            }
+        });
+        rootCauses.push({
+            type: 'bandwidth',
+            linkId: minBwLink ? minBwLink.id : null,
+            linkName: minBwLink ? getLinkDisplayName(minBwLink.id) : '未知',
+            details: `剩余带宽${minBw.toFixed(1)}Mbps < 最低${contract.minBandwidth}Mbps`
+        });
+    }
+
+    return {
+        isViolating: violationTypes.length > 0,
+        violationTypes,
+        rootCauses
+    };
+}
+
+function recordSlaViolationEvent(contract) {
+    const breachTypes = contract.violationTypes.slice();
+    const rootCause = contract.rootCauses.length > 0 ? contract.rootCauses[0] : null;
+
+    const event = {
+        timestamp: Date.now(),
+        contractName: contract.name,
+        eventType: 'violation',
+        breachTypes,
+        rootCauseLink: rootCause ? rootCause.linkName : null,
+        duration: 0
+    };
+
+    slaViolationEvents.unshift(event);
+    if (slaViolationEvents.length > SLA_MAX_EVENTS_DISPLAY) {
+        slaViolationEvents = slaViolationEvents.slice(0, SLA_MAX_EVENTS_DISPLAY);
+    }
+
+    saveSlaEventToBackend(event);
+
+    contract.rootCauses.forEach(rc => {
+        if (rc.linkId) {
+            slaBlinkLinks.set(rc.linkId, { startTime: Date.now() });
+        }
+    });
+
+    addLog(`SLA违约: ${contract.name} - ${breachTypes.map(t => ({latency:'延迟',loss_rate:'丢包',bandwidth:'带宽',unreachable:'不可达'}[t] || t)).join(',')}`, 'error');
+    renderSlaEventList();
+}
+
+function recordSlaRecoveryEvent(contract, duration) {
+    const event = {
+        timestamp: Date.now(),
+        contractName: contract.name,
+        eventType: 'recovery',
+        breachTypes: contract.violationTypes.slice(),
+        rootCauseLink: null,
+        duration: duration
+    };
+
+    slaViolationEvents.unshift(event);
+    if (slaViolationEvents.length > SLA_MAX_EVENTS_DISPLAY) {
+        slaViolationEvents = slaViolationEvents.slice(0, SLA_MAX_EVENTS_DISPLAY);
+    }
+
+    saveSlaEventToBackend(event);
+
+    addLog(`SLA恢复: ${contract.name} - 违约持续${(duration / 1000).toFixed(1)}s`, 'success');
+    renderSlaEventList();
+}
+
+async function saveSlaEventToBackend(event) {
+    await apiRequest('/sla/events', {
+        method: 'POST',
+        body: JSON.stringify(event)
+    });
+}
+
+function highlightSlaRootCause(linkId) {
+    const link = links.find(l => l.id === linkId);
+    if (!link) return;
+
+    clearHighlight();
+    highlightedElements.links.push(link);
+    slaBlinkLinks.set(linkId, { startTime: Date.now() });
+
+    highlightTimer = setTimeout(() => {
+        clearHighlight();
+    }, 5000);
+
+    addLog(`高亮违约根因链路: ${getLinkDisplayName(linkId)}`, 'info');
+}
+
+function renderSlaContractList() {
+    const listEl = document.getElementById('slaContractList');
+    const countEl = document.getElementById('slaContractCount');
+
+    if (!listEl) return;
+    countEl.textContent = slaContracts.length;
+
+    if (slaContracts.length === 0) {
+        listEl.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无SLA合约</p>';
+        return;
+    }
+
+    let html = '';
+    slaContracts.forEach(contract => {
+        const srcName = getDeviceName(contract.srcDeviceId);
+        const dstName = getDeviceName(contract.dstDeviceId);
+        const pathStr = contract.path ? getPathNodeNames(contract.path) : '不可达';
+        const metrics = contract.currentMetrics || {};
+
+        html += `<div class="sla-contract-item ${contract.isViolating ? 'violating' : ''}">`;
+        html += `<div class="sla-contract-item-header">`;
+        html += `<span class="sla-contract-name">`;
+        html += `<span class="sla-status-icon ${contract.isViolating ? 'violating' : 'compliant'}">${contract.isViolating ? '✗' : '✓'}</span>`;
+        html += `${escapeHtml(contract.name)}`;
+        html += `</span>`;
+        html += `<div class="sla-contract-actions">`;
+        html += `<button onclick="editSlaContract(${contract.id})">编辑</button>`;
+        html += `<button class="sla-delete-btn" onclick="deleteSlaContract(${contract.id})">删除</button>`;
+        html += `</div></div>`;
+
+        html += `<div class="sla-contract-path" title="${escapeHtml(pathStr)}">${srcName} → ${dstName}: ${escapeHtml(pathStr)}</div>`;
+
+        html += `<div class="sla-contract-metrics">`;
+        const latencyOk = metrics.latency !== undefined ? metrics.latency <= contract.maxLatency : true;
+        html += `<span class="sla-metric ${contract.isViolating && contract.violationTypes.includes('latency') ? 'breach' : (latencyOk ? 'ok' : '')}">延迟: ${metrics.latency !== undefined ? metrics.latency.toFixed(0) + 'ms' : '-'} / ${contract.maxLatency}ms</span>`;
+
+        const lossOk = metrics.lossRate !== undefined ? metrics.lossRate <= contract.maxLossRate : true;
+        html += `<span class="sla-metric ${contract.isViolating && contract.violationTypes.includes('loss_rate') ? 'breach' : (lossOk ? 'ok' : '')}">丢包: ${metrics.lossRate !== undefined ? metrics.lossRate.toFixed(1) + '%' : '-'} / ${contract.maxLossRate}%</span>`;
+
+        const bwOk = metrics.availableBandwidth !== undefined ? metrics.availableBandwidth >= contract.minBandwidth : true;
+        html += `<span class="sla-metric ${contract.isViolating && contract.violationTypes.includes('bandwidth') ? 'breach' : (bwOk ? 'ok' : '')}">带宽: ${metrics.availableBandwidth !== undefined ? metrics.availableBandwidth.toFixed(1) + 'M' : '-'} / ≥${contract.minBandwidth}M</span>`;
+        html += `</div>`;
+
+        if (contract.isViolating && contract.rootCauses.length > 0) {
+            html += `<div class="sla-contract-detail">`;
+            contract.rootCauses.forEach(rc => {
+                const typeLabels = { latency: '延迟违约', loss_rate: '丢包违约', bandwidth: '带宽违约', unreachable: '不可达' };
+                html += `<div class="sla-root-cause" ${rc.linkId ? `onclick="highlightSlaRootCause(${rc.linkId})"` : ''}>`;
+                html += `<div class="sla-root-cause-title">${typeLabels[rc.type] || rc.type}: ${escapeHtml(rc.linkName)}</div>`;
+                html += `<div class="sla-root-cause-detail">${escapeHtml(rc.details)}</div>`;
+
+                if (rc.type === 'latency' && rc.breakdown) {
+                    html += `<div class="sla-latency-breakdown"><div class="sla-latency-bar">`;
+                    const totalDelay = rc.breakdown.reduce((s, b) => s + b.delay, 0) || 1;
+                    const colors = ['#1890ff', '#52c41a', '#fa8c16', '#722ed1', '#eb2f96', '#13c2c2', '#fa541c', '#2f54eb'];
+                    rc.breakdown.forEach((b, i) => {
+                        const pct = (b.delay / totalDelay * 100).toFixed(1);
+                        html += `<div class="sla-latency-segment" style="width:${pct}%;background:${colors[i % colors.length]}" title="${escapeHtml(b.name)}: ${b.delay}ms (${pct}%)"></div>`;
+                    });
+                    html += `</div></div>`;
+                }
+
+                html += `</div>`;
+            });
+            html += `</div>`;
+        }
+
+        html += `</div>`;
+    });
+
+    listEl.innerHTML = html;
+}
+
+function renderSlaEventList() {
+    const listEl = document.getElementById('slaEventList');
+    if (!listEl) return;
+
+    if (slaViolationEvents.length === 0) {
+        listEl.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:8px 0;">暂无事件</p>';
+        return;
+    }
+
+    let html = '';
+    slaViolationEvents.forEach(event => {
+        const time = new Date(event.timestamp).toLocaleTimeString();
+        const isViolation = event.eventType === 'violation';
+        const typeLabels = { latency: '延迟', loss_rate: '丢包', bandwidth: '带宽', unreachable: '不可达' };
+        const breachLabel = event.breachTypes.map(t => typeLabels[t] || t).join(',');
+
+        html += `<div class="sla-event-item ${isViolation ? 'violation' : 'recovery'}">`;
+        html += `<div class="sla-event-time">${time}</div>`;
+        if (isViolation) {
+            html += `<div class="sla-event-detail">违约: ${escapeHtml(event.contractName)} - ${breachLabel}</div>`;
+            if (event.rootCauseLink) {
+                html += `<div class="sla-event-cause">根因: ${escapeHtml(event.rootCauseLink)}</div>`;
+            }
+        } else {
+            html += `<div class="sla-event-detail">恢复: ${escapeHtml(event.contractName)} - 违约持续${(event.duration / 1000).toFixed(1)}s</div>`;
+        }
+        html += `</div>`;
+    });
+
+    listEl.innerHTML = html;
+}
+
+function generateSlaReport() {
+    if (slaContracts.length === 0) {
+        alert('暂无SLA合约，无法生成报告');
+        return;
+    }
+
+    const reportData = [];
+    slaContracts.forEach(contract => {
+        const stats = slaContractStats.get(contract.id);
+        if (!stats) return;
+
+        const totalMs = stats.complianceMs + stats.violationMs;
+        const complianceRate = totalMs > 0 ? (stats.complianceMs / totalMs * 100) : 100;
+        const avgViolationDuration = stats.violationDurations.length > 0
+            ? stats.violationDurations.reduce((a, b) => a + b, 0) / stats.violationDurations.length / 1000
+            : 0;
+
+        const linkCountMap = new Map();
+        stats.rootCauseLinks.forEach(linkId => {
+            linkCountMap.set(linkId, (linkCountMap.get(linkId) || 0) + 1);
+        });
+        let mostFrequentRootCause = '-';
+        let maxCount = 0;
+        linkCountMap.forEach((count, linkId) => {
+            if (count > maxCount) {
+                maxCount = count;
+                mostFrequentRootCause = getLinkDisplayName(linkId);
+            }
+        });
+
+        reportData.push({
+            name: contract.name,
+            src: getDeviceName(contract.srcDeviceId),
+            dst: getDeviceName(contract.dstDeviceId),
+            complianceDuration: (stats.complianceMs / 1000).toFixed(1) + 's',
+            violationDuration: (stats.violationMs / 1000).toFixed(1) + 's',
+            complianceRate: complianceRate.toFixed(1) + '%',
+            violationCount: stats.violationCount,
+            avgViolationDuration: avgViolationDuration.toFixed(1) + 's',
+            mostFrequentRootCause
+        });
+    });
+
+    renderSlaReport(reportData);
+    addLog('SLA报告已生成', 'success');
+}
+
+function renderSlaReport(reportData) {
+    const container = document.getElementById('slaReportContent');
+    if (!container) return;
+    container.style.display = 'block';
+
+    let html = '<table class="sla-report-table"><thead><tr>';
+    html += '<th>合约</th><th>源</th><th>目的</th><th>达标时长</th><th>违约时长</th><th>达标率</th><th>违约次数</th><th>平均违约时长</th><th>最频根因</th>';
+    html += '</tr></thead><tbody>';
+
+    reportData.forEach(row => {
+        html += `<tr>`;
+        html += `<td>${escapeHtml(row.name)}</td>`;
+        html += `<td>${escapeHtml(row.src)}</td>`;
+        html += `<td>${escapeHtml(row.dst)}</td>`;
+        html += `<td>${row.complianceDuration}</td>`;
+        html += `<td>${row.violationDuration}</td>`;
+        html += `<td>${row.complianceRate}</td>`;
+        html += `<td>${row.violationCount}</td>`;
+        html += `<td>${row.avgViolationDuration}</td>`;
+        html += `<td>${escapeHtml(row.mostFrequentRootCause)}</td>`;
+        html += `</tr>`;
+    });
+
+    html += '</tbody></table>';
+    html += `<div class="sla-report-export"><button class="btn btn-small" onclick="exportSlaReport()">导出JSON</button></div>`;
+
+    container.innerHTML = html;
+}
+
+window.exportSlaReport = function() {
+    const reportData = [];
+    slaContracts.forEach(contract => {
+        const stats = slaContractStats.get(contract.id);
+        if (!stats) return;
+        const totalMs = stats.complianceMs + stats.violationMs;
+        const complianceRate = totalMs > 0 ? (stats.complianceMs / totalMs * 100) : 100;
+        const avgViolationDuration = stats.violationDurations.length > 0
+            ? stats.violationDurations.reduce((a, b) => a + b, 0) / stats.violationDurations.length / 1000
+            : 0;
+        const linkCountMap = new Map();
+        stats.rootCauseLinks.forEach(linkId => {
+            linkCountMap.set(linkId, (linkCountMap.get(linkId) || 0) + 1);
+        });
+        let mostFrequentRootCause = '-';
+        let maxCount = 0;
+        linkCountMap.forEach((count, linkId) => {
+            if (count > maxCount) {
+                maxCount = count;
+                mostFrequentRootCause = getLinkDisplayName(linkId);
+            }
+        });
+        reportData.push({
+            name: contract.name,
+            src: getDeviceName(contract.srcDeviceId),
+            dst: getDeviceName(contract.dstDeviceId),
+            complianceDurationSec: stats.complianceMs / 1000,
+            violationDurationSec: stats.violationMs / 1000,
+            complianceRate: complianceRate,
+            violationCount: stats.violationCount,
+            avgViolationDurationSec: avgViolationDuration,
+            mostFrequentRootCause
+        });
+    });
+
+    const json = JSON.stringify(reportData, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `sla_report_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    addLog('SLA报告已导出', 'success');
+};
+
+window.editSlaContract = editSlaContract;
+window.deleteSlaContract = deleteSlaContract;
+window.highlightSlaRootCause = highlightSlaRootCause;
+
+const originalDrawLinkSla = drawLink;
+drawLink = function(link) {
+    const blinkInfo = slaBlinkLinks.get(link.id);
+    if (blinkInfo) {
+        const from = devices.find(d => d.id === link.from);
+        const to = devices.find(d => d.id === link.to);
+        if (from && to) {
+            const elapsed = Date.now() - blinkInfo.startTime;
+            if (elapsed < 5000) {
+                const flash = Math.sin(elapsed / 100 * Math.PI) > 0;
+                ctx.save();
+                ctx.strokeStyle = flash ? '#ff0000' : '#ffff00';
+                ctx.lineWidth = 10;
+                ctx.lineCap = 'round';
+                ctx.beginPath();
+                ctx.moveTo(from.x, from.y);
+                ctx.lineTo(to.x, to.y);
+                ctx.stroke();
+                ctx.restore();
+            }
+        }
+    }
+    originalDrawLinkSla(link);
 };
 
 init();

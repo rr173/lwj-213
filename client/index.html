@@ -421,6 +421,57 @@
                 </div>
             </div>
 
+            <h3>SLA合约管理</h3>
+            <div class="sla-panel">
+                <div class="sla-create-form" id="slaCreateForm">
+                    <div class="form-group">
+                        <label>合约名称</label>
+                        <input type="text" id="slaName" placeholder="输入合约名称">
+                    </div>
+                    <div class="form-group">
+                        <label>源设备</label>
+                        <select id="slaSrcDevice"></select>
+                    </div>
+                    <div class="form-group">
+                        <label>目的设备</label>
+                        <select id="slaDstDevice"></select>
+                    </div>
+                    <div class="sla-thresholds">
+                        <div class="form-group">
+                            <label>最大延迟(ms)</label>
+                            <input type="number" id="slaMaxLatency" value="100" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label>最大丢包率(%)</label>
+                            <input type="number" id="slaMaxLossRate" value="5" min="0" max="100" step="0.1">
+                        </div>
+                        <div class="form-group">
+                            <label>最低带宽(Mbps)</label>
+                            <input type="number" id="slaMinBandwidth" value="10" min="1">
+                        </div>
+                    </div>
+                    <button id="slaCreateBtn" class="btn btn-primary">创建合约</button>
+                    <button id="slaEditBtn" class="btn btn-primary" style="display:none;">保存修改</button>
+                    <button id="slaCancelEditBtn" class="btn" style="display:none;">取消</button>
+                </div>
+                <div class="sla-contract-header">
+                    <span>合约列表 (<span id="slaContractCount">0</span>/20)</span>
+                </div>
+                <div class="sla-contract-list" id="slaContractList">
+                    <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无SLA合约</p>
+                </div>
+                <div class="sla-event-section">
+                    <div class="sla-event-header">违约事件 (最近20条)</div>
+                    <div class="sla-event-list" id="slaEventList">
+                        <p class="hint" style="font-size:11px;color:#999;text-align:center;padding:8px 0;">暂无事件</p>
+                    </div>
+                </div>
+                <div class="sla-report-section">
+                    <button id="slaGenerateReportBtn" class="btn btn-primary" style="width:100%;margin-bottom:8px;">生成SLA报告</button>
+                    <div id="slaReportContent" style="display:none;"></div>
+                </div>
+            </div>
+
             <h3>流量录制差异分析</h3>
             <div class="recording-compare-panel">
                 <div class="compare-selectors">
