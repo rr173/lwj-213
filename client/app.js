@@ -5498,6 +5498,29 @@ function setupSlaEvents() {
         origUpdateDeviceSelects();
         updateSlaDeviceSelects();
     };
+
+    loadSlaHistoryEvents();
+}
+
+async function loadSlaHistoryEvents() {
+    try {
+        const resp = await apiRequest(`/sla/events?limit=${SLA_MAX_EVENTS_DISPLAY}`, {
+            method: 'GET'
+        });
+        if (resp && resp.success && resp.data && resp.data.length > 0) {
+            slaViolationEvents = resp.data.map(e => ({
+                timestamp: e.timestamp,
+                contractName: e.contractName,
+                eventType: e.eventType,
+                breachTypes: e.breachTypes || [],
+                rootCauseLink: e.rootCauseLink || null,
+                duration: e.duration || 0
+            }));
+            renderSlaEventList();
+        }
+    } catch (err) {
+        console.error('加载SLA历史事件失败:', err);
+    }
 }
 
 function updateSlaDeviceSelects() {
@@ -5557,6 +5580,7 @@ function createSlaContract() {
         isViolating: false,
         violationTypes: [],
         rootCauses: [],
+        lastViolationSnapshot: null,
         monitoring: true,
         createdAt: Date.now(),
         violationStartTime: null
@@ -5687,8 +5711,14 @@ function slaMonitorTick() {
             contract.violationTypes = ['unreachable'];
             contract.rootCauses = [{ type: 'unreachable', linkId: null, linkName: '无可用路径', details: '源到目的不可达' }];
             if (!wasViolating) {
-                recordSlaViolationEvent(contract);
+                stats.violationCount++;
                 contract.violationStartTime = Date.now();
+                contract.lastViolationSnapshot = {
+                    violationTypes: contract.violationTypes.slice(),
+                    rootCauses: JSON.parse(JSON.stringify(contract.rootCauses))
+                };
+                stats.rootCauseLinks.push(null);
+                recordSlaViolationEvent(contract);
             }
             stats.violationMs += SLA_MONITOR_INTERVAL;
             return;
@@ -5708,13 +5738,15 @@ function slaMonitorTick() {
             if (!wasViolating) {
                 stats.violationCount++;
                 contract.violationStartTime = Date.now();
+                contract.lastViolationSnapshot = {
+                    violationTypes: result.violationTypes.slice(),
+                    rootCauses: JSON.parse(JSON.stringify(result.rootCauses))
+                };
+                result.rootCauses.forEach(rc => {
+                    stats.rootCauseLinks.push(rc.linkId || null);
+                });
                 recordSlaViolationEvent(contract);
             }
-            result.rootCauses.forEach(rc => {
-                if (rc.linkId) {
-                    stats.rootCauseLinks.push(rc.linkId);
-                }
-            });
         } else {
             stats.complianceMs += SLA_MONITOR_INTERVAL;
             if (wasViolating) {
@@ -5722,6 +5754,7 @@ function slaMonitorTick() {
                 stats.violationDurations.push(duration);
                 recordSlaRecoveryEvent(contract, duration);
                 contract.violationStartTime = null;
+                contract.lastViolationSnapshot = null;
             }
         }
     });
@@ -5872,12 +5905,16 @@ function recordSlaViolationEvent(contract) {
 }
 
 function recordSlaRecoveryEvent(contract, duration) {
+    const snapshot = contract.lastViolationSnapshot;
+    const breachTypes = snapshot ? snapshot.violationTypes : [];
+    const rootCause = snapshot && snapshot.rootCauses && snapshot.rootCauses.length > 0 ? snapshot.rootCauses[0] : null;
+
     const event = {
         timestamp: Date.now(),
         contractName: contract.name,
         eventType: 'recovery',
-        breachTypes: contract.violationTypes.slice(),
-        rootCauseLink: null,
+        breachTypes,
+        rootCauseLink: rootCause ? rootCause.linkName : null,
         duration: duration
     };
 
@@ -5888,7 +5925,8 @@ function recordSlaRecoveryEvent(contract, duration) {
 
     saveSlaEventToBackend(event);
 
-    addLog(`SLA恢复: ${contract.name} - 违约持续${(duration / 1000).toFixed(1)}s`, 'success');
+    const breachLabel = breachTypes.map(t => ({latency:'延迟',loss_rate:'丢包',bandwidth:'带宽',unreachable:'不可达'}[t] || t)).join(',') || '未知';
+    addLog(`SLA恢复: ${contract.name} - 类型[${breachLabel}]持续${(duration / 1000).toFixed(1)}s`, 'success');
     renderSlaEventList();
 }
 
@@ -6045,7 +6083,7 @@ function generateSlaReport() {
         linkCountMap.forEach((count, linkId) => {
             if (count > maxCount) {
                 maxCount = count;
-                mostFrequentRootCause = getLinkDisplayName(linkId);
+                mostFrequentRootCause = linkId === null ? '不可达(无可用路径)' : getLinkDisplayName(linkId);
             }
         });
 
@@ -6114,7 +6152,7 @@ window.exportSlaReport = function() {
         linkCountMap.forEach((count, linkId) => {
             if (count > maxCount) {
                 maxCount = count;
-                mostFrequentRootCause = getLinkDisplayName(linkId);
+                mostFrequentRootCause = linkId === null ? '不可达(无可用路径)' : getLinkDisplayName(linkId);
             }
         });
         reportData.push({
