@@ -34,7 +34,14 @@ const {
   updateMigrationBatch,
   updateMigrationFlow,
   deleteMigrationTask,
-  duplicateMigrationTask
+  duplicateMigrationTask,
+  saveFaultPlaybook,
+  listFaultPlaybooks,
+  getFaultPlaybook,
+  deleteFaultPlaybook,
+  saveResilienceReport,
+  listResilienceReports,
+  getResilienceReport
 } = require('./database');
 
 const app = express();
@@ -656,6 +663,167 @@ app.put('/api/migration/flows/:id', async (req, res) => {
   } catch (err) {
     console.error('更新迁移流失败:', err);
     res.status(500).json({ error: '更新失败' });
+  }
+});
+
+app.post('/api/fault-playbooks', async (req, res) => {
+  try {
+    const { name, description, events } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: '剧本名称不能为空' });
+    }
+
+    const result = await saveFaultPlaybook({
+      name: name.trim(),
+      description: description || '',
+      events: events || []
+    });
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存故障剧本失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/fault-playbooks', async (req, res) => {
+  try {
+    const result = await listFaultPlaybooks();
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('获取故障剧本列表失败:', err);
+    res.status(500).json({ error: '获取列表失败' });
+  }
+});
+
+app.get('/api/fault-playbooks/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的剧本ID' });
+    }
+
+    const result = await getFaultPlaybook(id);
+    if (!result) {
+      return res.status(404).json({ error: '剧本不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('获取故障剧本详情失败:', err);
+    res.status(500).json({ error: '获取详情失败' });
+  }
+});
+
+app.put('/api/fault-playbooks/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的剧本ID' });
+    }
+
+    const { name, description, events } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: '剧本名称不能为空' });
+    }
+
+    const result = await saveFaultPlaybook({
+      id,
+      name: name.trim(),
+      description: description || '',
+      events: events || []
+    });
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('更新故障剧本失败:', err);
+    res.status(500).json({ error: '更新失败' });
+  }
+});
+
+app.delete('/api/fault-playbooks/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的剧本ID' });
+    }
+
+    const result = await deleteFaultPlaybook(id);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('删除故障剧本失败:', err);
+    res.status(500).json({ error: '删除失败' });
+  }
+});
+
+app.post('/api/resilience-reports', async (req, res) => {
+  try {
+    const reportData = req.body;
+
+    if (!reportData.playbookName) {
+      return res.status(400).json({ error: '剧本名称不能为空' });
+    }
+
+    const result = await saveResilienceReport(reportData);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存韧性评估报告失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/resilience-reports', async (req, res) => {
+  try {
+    const result = await listResilienceReports();
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('获取韧性评估报告列表失败:', err);
+    res.status(500).json({ error: '获取列表失败' });
+  }
+});
+
+app.get('/api/resilience-reports/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的报告ID' });
+    }
+
+    const result = await getResilienceReport(id);
+    if (!result) {
+      return res.status(404).json({ error: '报告不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('获取韧性评估报告详情失败:', err);
+    res.status(500).json({ error: '获取详情失败' });
   }
 });
 

@@ -7464,6 +7464,1038 @@ window.duplicateMigrationTask = duplicateMigrationTask;
 window.deleteMigrationTask = deleteMigrationTask;
 window.backFromMigrationDetail = backFromMigrationDetail;
 
+let faultPlaybooks = [];
+let currentPlaybook = null;
+let currentPlaybookEvents = [];
+
+let playbackState = {
+    isPlaying: false,
+    isPaused: false,
+    startTime: 0,
+    pausedTime: 0,
+    pausedDuration: 0,
+    currentEventIndex: 0,
+    totalEvents: 0,
+    timerId: null,
+    prePlaybackLinkStates: [],
+    currentPlaybookId: null
+};
+
+let resilienceSamples = [];
+let samplingTimerId = null;
+const SAMPLING_INTERVAL = 200;
+
+let currentResilienceReport = null;
+
+function switchPlaybookTab(tabName) {
+    document.querySelectorAll('.playbook-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.playbookTab === tabName);
+    });
+
+    document.querySelectorAll('#playbook-tab-editor, #playbook-tab-history').forEach(content => {
+        content.style.display = 'none';
+    });
+
+    document.getElementById('playbook-tab-' + tabName).style.display = 'block';
+
+    if (tabName === 'history') {
+        loadResilienceReportHistory();
+    }
+}
+
+async function loadFaultPlaybooks() {
+    try {
+        const result = await apiRequest('/fault-playbooks');
+        if (result.success) {
+            faultPlaybooks = result.data;
+            renderPlaybookSelect();
+        }
+    } catch (err) {
+        console.error('加载故障剧本列表失败:', err);
+    }
+}
+
+function renderPlaybookSelect() {
+    const select = document.getElementById('playbookSelect');
+    select.innerHTML = '<option value="">-- 选择/新建 --</option>';
+
+    faultPlaybooks.forEach(playbook => {
+        const option = document.createElement('option');
+        option.value = playbook.id;
+        option.textContent = `${playbook.name} (${playbook.eventCount}个事件)`;
+        select.appendChild(option);
+    });
+}
+
+function onPlaybookSelectChange() {
+    const select = document.getElementById('playbookSelect');
+    const playbookId = select.value;
+
+    if (playbookId) {
+        loadPlaybookDetail(parseInt(playbookId));
+    } else {
+        clearPlaybookEditor();
+    }
+}
+
+async function loadPlaybookDetail(playbookId) {
+    try {
+        const result = await apiRequest('/fault-playbooks/' + playbookId);
+        if (result.success && result.data) {
+            currentPlaybook = result.data;
+            currentPlaybookEvents = [...(result.data.events || [])];
+
+            document.getElementById('playbookName').value = result.data.name;
+            document.getElementById('playbookDesc').value = result.data.description || '';
+
+            showPlaybookEditor();
+            renderPlaybookEvents();
+            updatePlayButtonState();
+        }
+    } catch (err) {
+        console.error('加载剧本详情失败:', err);
+        alert('加载剧本详情失败');
+    }
+}
+
+function clearPlaybookEditor() {
+    currentPlaybook = null;
+    currentPlaybookEvents = [];
+
+    document.getElementById('playbookName').value = '';
+    document.getElementById('playbookDesc').value = '';
+
+    document.getElementById('playbookInfo').style.display = 'none';
+    document.getElementById('playbookEventsSection').style.display = 'none';
+    document.getElementById('playbookEmpty').style.display = 'block';
+    document.getElementById('deletePlaybookBtn').style.display = 'none';
+
+    updatePlayButtonState();
+}
+
+function showPlaybookEditor() {
+    document.getElementById('playbookInfo').style.display = 'block';
+    document.getElementById('playbookEventsSection').style.display = 'block';
+    document.getElementById('playbookEmpty').style.display = 'none';
+    document.getElementById('deletePlaybookBtn').style.display = 'inline-block';
+}
+
+function newPlaybook() {
+    if (playbackState.isPlaying) {
+        alert('播放中无法新建剧本');
+        return;
+    }
+
+    currentPlaybook = null;
+    currentPlaybookEvents = [];
+
+    document.getElementById('playbookSelect').value = '';
+    document.getElementById('playbookName').value = '新故障剧本';
+    document.getElementById('playbookDesc').value = '';
+
+    showPlaybookEditor();
+    renderPlaybookEvents();
+    updatePlayButtonState();
+}
+
+function renderPlaybookEvents() {
+    const list = document.getElementById('playbookEventsList');
+
+    if (currentPlaybookEvents.length === 0) {
+        list.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无事件，点击"添加事件"开始编排</p>';
+        return;
+    }
+
+    const sortedEvents = [...currentPlaybookEvents].sort((a, b) => a.time - b.time);
+
+    let html = '';
+    sortedEvents.forEach((event, index) => {
+        const link = links.find(l => l.id === event.linkId);
+        const linkName = link ? getLinkName(link) : '未知链路';
+
+        html += `
+            <div class="playbook-event-item" data-index="${index}">
+                <input type="number" class="event-time" value="${event.time.toFixed(1)}" 
+                       step="0.1" min="0" onchange="updateEventTime(${index}, this.value)">
+                <select class="event-link" onchange="updateEventLink(${index}, this.value)" ${playbackState.isPlaying ? 'disabled' : ''}>
+                    ${getLinkSelectOptions(event.linkId)}
+                </select>
+                <button class="event-action ${event.action === 'break' ? 'break' : 'restore'}" 
+                        onclick="toggleEventAction(${index})" ${playbackState.isPlaying ? 'disabled' : ''}>
+                    ${event.action === 'break' ? '断开' : '恢复'}
+                </button>
+                <span class="event-delete" onclick="deletePlaybookEvent(${index})" 
+                      ${playbackState.isPlaying ? 'style="pointer-events:none;opacity:0.3;"' : ''}>×</span>
+            </div>
+        `;
+    });
+
+    list.innerHTML = html;
+}
+
+function getLinkSelectOptions(selectedId) {
+    let options = '<option value="">选择链路</option>';
+    links.forEach(link => {
+        const name = getLinkName(link);
+        options += `<option value="${link.id}" ${link.id === selectedId ? 'selected' : ''}>${name}</option>`;
+    });
+    return options;
+}
+
+function getLinkName(link) {
+    const srcDev = devices.find(d => d.id === link.from);
+    const dstDev = devices.find(d => d.id === link.to);
+    const srcName = srcDev ? srcDev.name : '?';
+    const dstName = dstDev ? dstDev.name : '?';
+    return `${srcName}-${dstName}`;
+}
+
+function addPlaybookEvent() {
+    if (playbackState.isPlaying) return;
+
+    if (links.length === 0) {
+        alert('请先创建链路');
+        return;
+    }
+
+    const lastEvent = currentPlaybookEvents[currentPlaybookEvents.length - 1];
+    const newTime = lastEvent ? lastEvent.time + 1.0 : 0;
+
+    currentPlaybookEvents.push({
+        time: newTime,
+        linkId: links[0].id,
+        action: 'break'
+    });
+
+    renderPlaybookEvents();
+}
+
+function updateEventTime(index, value) {
+    if (playbackState.isPlaying) return;
+    const time = parseFloat(value);
+    if (!isNaN(time) && time >= 0) {
+        currentPlaybookEvents[index].time = Math.round(time * 10) / 10;
+        renderPlaybookEvents();
+    }
+}
+
+function updateEventLink(index, linkId) {
+    if (playbackState.isPlaying) return;
+    currentPlaybookEvents[index].linkId = parseInt(linkId);
+}
+
+function toggleEventAction(index) {
+    if (playbackState.isPlaying) return;
+    currentPlaybookEvents[index].action = 
+        currentPlaybookEvents[index].action === 'break' ? 'restore' : 'break';
+    renderPlaybookEvents();
+}
+
+function deletePlaybookEvent(index) {
+    if (playbackState.isPlaying) return;
+    currentPlaybookEvents.splice(index, 1);
+    renderPlaybookEvents();
+}
+
+async function savePlaybook() {
+    if (playbackState.isPlaying) {
+        alert('播放中无法保存');
+        return;
+    }
+
+    const name = document.getElementById('playbookName').value.trim();
+    if (!name) {
+        alert('请输入剧本名称');
+        return;
+    }
+
+    const description = document.getElementById('playbookDesc').value.trim();
+
+    try {
+        const result = await apiRequest('/fault-playbooks' + (currentPlaybook ? '/' + currentPlaybook.id : ''), {
+            method: currentPlaybook ? 'PUT' : 'POST',
+            body: JSON.stringify({
+                name,
+                description,
+                events: currentPlaybookEvents
+            })
+        });
+
+        if (result.success) {
+            addLog(`故障剧本已保存: ${name}`, 'success');
+            await loadFaultPlaybooks();
+
+            if (currentPlaybook) {
+                document.getElementById('playbookSelect').value = currentPlaybook.id;
+            } else {
+                document.getElementById('playbookSelect').value = result.data.id;
+                currentPlaybook = result.data;
+            }
+        } else {
+            alert('保存失败: ' + (result.error || '未知错误'));
+        }
+    } catch (err) {
+        alert('保存失败: ' + err.message);
+    }
+}
+
+async function deletePlaybook() {
+    if (!currentPlaybook) return;
+    if (playbackState.isPlaying) {
+        alert('播放中无法删除');
+        return;
+    }
+
+    if (!confirm('确定要删除这个故障剧本吗？')) return;
+
+    try {
+        const result = await apiRequest('/fault-playbooks/' + currentPlaybook.id, {
+            method: 'DELETE'
+        });
+
+        if (result.success) {
+            addLog('故障剧本已删除', 'info');
+            await loadFaultPlaybooks();
+            clearPlaybookEditor();
+        }
+    } catch (err) {
+        alert('删除失败: ' + err.message);
+    }
+}
+
+function updatePlayButtonState() {
+    const playBtn = document.getElementById('playPlaybookBtn');
+    const canPlay = currentPlaybookEvents.length > 0 && !playbackState.isPlaying;
+    playBtn.disabled = !canPlay;
+    playBtn.style.opacity = canPlay ? '1' : '0.5';
+}
+
+function startPlayback() {
+    if (!currentPlaybookEvents || currentPlaybookEvents.length === 0) {
+        alert('请先添加故障事件');
+        return;
+    }
+
+    if (playbackState.isPlaying) return;
+
+    playbackState.prePlaybackLinkStates = links.map(link => ({
+        id: link.id,
+        enabled: link.enabled !== false
+    }));
+
+    playbackState.currentPlaybookId = currentPlaybook ? currentPlaybook.id : null;
+
+    const sortedEvents = [...currentPlaybookEvents].sort((a, b) => a.time - b.time);
+
+    playbackState.isPlaying = true;
+    playbackState.isPaused = false;
+    playbackState.startTime = Date.now();
+    playbackState.pausedDuration = 0;
+    playbackState.currentEventIndex = 0;
+    playbackState.totalEvents = sortedEvents.length;
+
+    resilienceSamples = [];
+
+    updatePlaybackUI();
+    updatePlayButtonState();
+
+    startSampling();
+
+    processPlaybackEvents(sortedEvents);
+}
+
+function processPlaybackEvents(sortedEvents) {
+    const checkEvents = () => {
+        if (!playbackState.isPlaying || playbackState.isPaused) return;
+
+        const elapsed = (Date.now() - playbackState.startTime - playbackState.pausedDuration) / 1000;
+
+        while (playbackState.currentEventIndex < sortedEvents.length &&
+               sortedEvents[playbackState.currentEventIndex].time <= elapsed) {
+            const event = sortedEvents[playbackState.currentEventIndex];
+            executePlaybackEvent(event);
+            playbackState.currentEventIndex++;
+            updatePlaybackUI();
+        }
+
+        updatePlaybackProgress(elapsed);
+
+        if (playbackState.currentEventIndex >= sortedEvents.length) {
+            setTimeout(() => {
+                finishPlayback('completed');
+            }, 500);
+            return;
+        }
+
+        playbackState.timerId = setTimeout(checkEvents, 50);
+    };
+
+    checkEvents();
+}
+
+function executePlaybackEvent(event) {
+    const link = links.find(l => l.id === event.linkId);
+    if (!link) return;
+
+    if (event.action === 'break') {
+        if (link.enabled !== false) {
+            link.enabled = false;
+            faultStats.disabledLinkCount++;
+            faultStats.totalFaultCount++;
+            handleLinkStateChange(link.id, 'disable_link');
+        }
+        addLog(`[故障剧本] 断开链路: ${getLinkName(link)}`, 'warning');
+    } else if (event.action === 'restore') {
+        if (link.enabled === false) {
+            link.enabled = true;
+            faultStats.disabledLinkCount--;
+            handleLinkStateChange(link.id, 'enable_link');
+        }
+        addLog(`[故障剧本] 恢复链路: ${getLinkName(link)}`, 'success');
+    }
+}
+
+function updatePlaybackUI() {
+    const statusText = document.getElementById('playbackStatusText');
+    const statusIndicator = document.getElementById('playbackStatusIndicator');
+    const playBtn = document.getElementById('playPlaybookBtn');
+    const pauseBtn = document.getElementById('pausePlaybackBtn');
+    const resumeBtn = document.getElementById('resumePlaybackBtn');
+    const stopBtn = document.getElementById('stopPlaybackBtn');
+
+    if (playbackState.isPlaying && !playbackState.isPaused) {
+        statusText.textContent = '播放中';
+        statusIndicator.className = 'playback-status-indicator playing';
+        playBtn.style.display = 'none';
+        pauseBtn.style.display = 'block';
+        resumeBtn.style.display = 'none';
+        stopBtn.style.display = 'block';
+    } else if (playbackState.isPaused) {
+        statusText.textContent = '已暂停';
+        statusIndicator.className = 'playback-status-indicator paused';
+        playBtn.style.display = 'none';
+        pauseBtn.style.display = 'none';
+        resumeBtn.style.display = 'block';
+        stopBtn.style.display = 'block';
+    } else {
+        statusText.textContent = '未播放';
+        statusIndicator.className = 'playback-status-indicator';
+        playBtn.style.display = 'block';
+        pauseBtn.style.display = 'none';
+        resumeBtn.style.display = 'none';
+        stopBtn.style.display = 'none';
+    }
+
+    const progressText = document.getElementById('playbackEventProgress');
+    progressText.textContent = `${playbackState.currentEventIndex}/${playbackState.totalEvents} 事件`;
+}
+
+function updatePlaybackProgress(elapsedSeconds) {
+    const sortedEvents = [...currentPlaybookEvents].sort((a, b) => a.time - b.time);
+    const totalDuration = sortedEvents.length > 0 ? sortedEvents[sortedEvents.length - 1].time : 0;
+
+    const progressFill = document.getElementById('playbackProgressFill');
+    const timeText = document.getElementById('playbackTimeProgress');
+
+    const progress = totalDuration > 0 ? Math.min(100, (elapsedSeconds / totalDuration) * 100) : 0;
+    progressFill.style.width = progress + '%';
+    timeText.textContent = elapsedSeconds.toFixed(1) + 's';
+}
+
+function pausePlayback() {
+    if (!playbackState.isPlaying || playbackState.isPaused) return;
+
+    playbackState.isPaused = true;
+    playbackState.pausedTime = Date.now();
+
+    if (playbackState.timerId) {
+        clearTimeout(playbackState.timerId);
+        playbackState.timerId = null;
+    }
+
+    stopSampling();
+    updatePlaybackUI();
+}
+
+function resumePlayback() {
+    if (!playbackState.isPaused) return;
+
+    const pauseDuration = Date.now() - playbackState.pausedTime;
+    playbackState.pausedDuration += pauseDuration;
+    playbackState.isPaused = false;
+
+    const sortedEvents = [...currentPlaybookEvents].sort((a, b) => a.time - b.time);
+
+    startSampling();
+    processPlaybackEvents(sortedEvents);
+    updatePlaybackUI();
+}
+
+function stopPlayback() {
+    if (!playbackState.isPlaying) return;
+
+    finishPlayback('aborted');
+}
+
+function finishPlayback(status) {
+    playbackState.isPlaying = false;
+    playbackState.isPaused = false;
+
+    if (playbackState.timerId) {
+        clearTimeout(playbackState.timerId);
+        playbackState.timerId = null;
+    }
+
+    stopSampling();
+
+    if (status === 'aborted') {
+        restorePrePlaybackState();
+        addLog('[故障剧本] 播放已终止，链路已恢复', 'info');
+    } else {
+        addLog('[故障剧本] 播放完成', 'success');
+    }
+
+    updatePlaybackUI();
+    updatePlayButtonState();
+
+    generateResilienceReport(status);
+}
+
+function restorePrePlaybackState() {
+    let changed = false;
+
+    playbackState.prePlaybackLinkStates.forEach(state => {
+        const link = links.find(l => l.id === state.id);
+        if (link) {
+            const oldEnabled = link.enabled !== false;
+            const newEnabled = state.enabled;
+
+            if (oldEnabled !== newEnabled) {
+                link.enabled = newEnabled;
+                changed = true;
+
+                if (newEnabled) {
+                    faultStats.disabledLinkCount--;
+                } else {
+                    faultStats.disabledLinkCount++;
+                }
+            }
+        }
+    });
+
+    if (changed) {
+        handleLinkStateChange(null, 'restore_all');
+        updateFaultStats();
+    }
+}
+
+function startSampling() {
+    if (samplingTimerId) return;
+
+    sampleResilienceState();
+
+    samplingTimerId = setInterval(() => {
+        sampleResilienceState();
+    }, SAMPLING_INTERVAL);
+}
+
+function stopSampling() {
+    if (samplingTimerId) {
+        clearInterval(samplingTimerId);
+        samplingTimerId = null;
+    }
+}
+
+function sampleResilienceState() {
+    const elapsed = playbackState.isPlaying 
+        ? (Date.now() - playbackState.startTime - playbackState.pausedDuration) / 1000
+        : 0;
+
+    const partitionCount = partitions.length;
+
+    let unreachablePairs = 0;
+    if (partitions.length > 1) {
+        const totalDevices = devices.length;
+        let sumSquares = 0;
+        partitions.forEach(p => {
+            sumSquares += p.deviceIds.length * p.deviceIds.length;
+        });
+        unreachablePairs = (totalDevices * totalDevices - sumSquares) / 2;
+    }
+
+    let pausedFlowCount = 0;
+    trafficFlows.forEach(flow => {
+        if (flow.status === 'paused' || flow.status === 'unreachable') {
+            pausedFlowCount++;
+        }
+    });
+
+    let slaBreachCount = 0;
+    if (typeof slaContracts !== 'undefined' && slaContracts) {
+        slaContracts.forEach(contract => {
+            if (contract.status === 'breached') {
+                slaBreachCount++;
+            }
+        });
+    }
+
+    resilienceSamples.push({
+        time: Math.round(elapsed * 10) / 10,
+        partitionCount,
+        unreachablePairs,
+        pausedFlowCount,
+        slaBreachCount
+    });
+}
+
+function generateResilienceReport(status) {
+    if (resilienceSamples.length === 0) {
+        sampleResilienceState();
+    }
+
+    const totalDuration = resilienceSamples.length > 0 
+        ? resilienceSamples[resilienceSamples.length - 1].time 
+        : 0;
+
+    const totalEvents = playbackState.totalEvents;
+    const triggeredEvents = playbackState.currentEventIndex;
+
+    let maxPartitionCount = 1;
+    let longestDisconnectDuration = 0;
+    let totalDisconnectDuration = 0;
+    let disconnectionStart = null;
+
+    resilienceSamples.forEach(sample => {
+        if (sample.partitionCount > maxPartitionCount) {
+            maxPartitionCount = sample.partitionCount;
+        }
+
+        if (sample.partitionCount > 1) {
+            if (disconnectionStart === null) {
+                disconnectionStart = sample.time;
+            }
+        } else {
+            if (disconnectionStart !== null) {
+                const duration = sample.time - disconnectionStart;
+                totalDisconnectDuration += duration;
+                if (duration > longestDisconnectDuration) {
+                    longestDisconnectDuration = duration;
+                }
+                disconnectionStart = null;
+            }
+        }
+    });
+
+    if (disconnectionStart !== null) {
+        const duration = totalDuration - disconnectionStart;
+        totalDisconnectDuration += duration;
+        if (duration > longestDisconnectDuration) {
+            longestDisconnectDuration = duration;
+        }
+    }
+
+    const linkRanking = calculateLinkResilienceRanking();
+
+    const recoverySpeeds = calculateRecoverySpeeds();
+
+    const sortedSamples = [...resilienceSamples].sort((a, b) => a.time - b.time);
+
+    currentResilienceReport = {
+        playbookId: currentPlaybook ? currentPlaybook.id : null,
+        playbookName: currentPlaybook ? currentPlaybook.name : '未命名剧本',
+        status,
+        totalDuration,
+        totalEvents,
+        triggeredEvents,
+        maxPartitionCount,
+        longestDisconnectDuration,
+        totalDisconnectDuration,
+        linkResilienceRanking: linkRanking,
+        timelineSamples: sortedSamples,
+        recoverySpeeds,
+        slaBreachCount: sortedSamples.length > 0 ? sortedSamples[sortedSamples.length - 1].slaBreachCount : 0,
+        pausedFlowCount: sortedSamples.length > 0 ? sortedSamples[sortedSamples.length - 1].pausedFlowCount : 0,
+        unreachablePairCount: sortedSamples.length > 0 ? sortedSamples[sortedSamples.length - 1].unreachablePairs : 0,
+        timestamp: Date.now()
+    };
+
+    renderResilienceReport();
+    saveResilienceReportToBackend(currentResilienceReport);
+}
+
+function calculateLinkResilienceRanking() {
+    const linkImpacts = new Map();
+
+    const sortedEvents = [...currentPlaybookEvents]
+        .filter(e => e.action === 'break')
+        .sort((a, b) => a.time - b.time);
+
+    let prevPartitions = 1;
+    let prevPausedFlows = 0;
+
+    sortedEvents.forEach(event => {
+        const link = links.find(l => l.id === event.linkId);
+        if (!link) return;
+
+        const eventSample = resilienceSamples.find(s => s.time >= event.time);
+        if (eventSample) {
+            const partitionIncrease = eventSample.partitionCount - prevPartitions;
+            const pausedFlowIncrease = eventSample.pausedFlowCount - prevPausedFlows;
+
+            const linkName = getLinkName(link);
+            if (!linkImpacts.has(event.linkId)) {
+                linkImpacts.set(event.linkId, {
+                    linkId: event.linkId,
+                    linkName,
+                    totalPartitionIncrease: 0,
+                    maxPartitionIncrease: 0,
+                    totalPauseIncrease: 0,
+                    maxPauseIncrease: 0,
+                    breakCount: 0
+                });
+            }
+
+            const impact = linkImpacts.get(event.linkId);
+            impact.totalPartitionIncrease += Math.max(0, partitionIncrease);
+            impact.maxPartitionIncrease = Math.max(impact.maxPartitionIncrease, partitionIncrease);
+            impact.totalPauseIncrease += Math.max(0, pausedFlowIncrease);
+            impact.maxPauseIncrease = Math.max(impact.maxPauseIncrease, pausedFlowIncrease);
+            impact.breakCount++;
+
+            prevPartitions = eventSample.partitionCount;
+            prevPausedFlows = eventSample.pausedFlowCount;
+        }
+    });
+
+    const ranking = Array.from(linkImpacts.values()).sort((a, b) => {
+        const scoreA = a.totalPartitionIncrease * 10 + a.totalPauseIncrease;
+        const scoreB = b.totalPartitionIncrease * 10 + b.totalPauseIncrease;
+        return scoreB - scoreA;
+    });
+
+    return ranking;
+}
+
+function calculateRecoverySpeeds() {
+    const recoveryEvents = [...currentPlaybookEvents]
+        .filter(e => e.action === 'restore')
+        .sort((a, b) => a.time - b.time);
+
+    const speeds = [];
+
+    recoveryEvents.forEach(event => {
+        const link = links.find(l => l.id === event.linkId);
+        if (!link) return;
+
+        const recoveryStartTime = event.time;
+
+        let fullyRecoveredTime = null;
+        let initialPausedCount = 0;
+
+        for (let i = 0; i < resilienceSamples.length; i++) {
+            const sample = resilienceSamples[i];
+
+            if (sample.time >= recoveryStartTime) {
+                if (fullyRecoveredTime === null) {
+                    const startSample = resilienceSamples.find(s => s.time >= recoveryStartTime);
+                    initialPausedCount = startSample ? startSample.pausedFlowCount : 0;
+                }
+
+                if (sample.pausedFlowCount <= Math.max(0, initialPausedCount - 1) || 
+                    sample.partitionCount <= 1) {
+                    fullyRecoveredTime = sample.time;
+                    break;
+                }
+            }
+        }
+
+        if (fullyRecoveredTime !== null) {
+            speeds.push({
+                linkId: event.linkId,
+                linkName: getLinkName(link),
+                recoveryTime: Math.round((fullyRecoveredTime - recoveryStartTime) * 100) / 100
+            });
+        }
+    });
+
+    return speeds.sort((a, b) => a.recoveryTime - b.recoveryTime);
+}
+
+function renderResilienceReport() {
+    if (!currentResilienceReport) return;
+
+    document.getElementById('resilienceReportEmpty').style.display = 'none';
+    document.getElementById('resilienceReportContainer').style.display = 'block';
+
+    document.getElementById('resilienceReportTitle').textContent = 
+        `${currentResilienceReport.playbookName} - 韧性评估报告`;
+
+    renderResilienceOverview();
+    renderLinkRanking();
+    renderResilienceTimeline();
+    renderRecoverySpeeds();
+}
+
+function renderResilienceOverview() {
+    const report = currentResilienceReport;
+    const container = document.getElementById('resilienceOverviewStats');
+
+    container.innerHTML = `
+        <div class="report-stat-item">
+            <div class="stat-value">${report.totalDuration.toFixed(1)}s</div>
+            <div class="stat-label">总时长</div>
+        </div>
+        <div class="report-stat-item">
+            <div class="stat-value">${report.triggeredEvents}/${report.totalEvents}</div>
+            <div class="stat-label">故障事件</div>
+        </div>
+        <div class="report-stat-item">
+            <div class="stat-value" style="color: #f5222d;">${report.maxPartitionCount}</div>
+            <div class="stat-label">最大分区数</div>
+        </div>
+        <div class="report-stat-item">
+            <div class="stat-value">${report.longestDisconnectDuration.toFixed(1)}s</div>
+            <div class="stat-label">最长不连通</div>
+        </div>
+    `;
+}
+
+function renderLinkRanking() {
+    const ranking = currentResilienceReport.linkResilienceRanking;
+    const container = document.getElementById('resilienceLinkRanking');
+
+    if (ranking.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">无数据</p>';
+        return;
+    }
+
+    let html = '';
+    ranking.forEach((item, index) => {
+        html += `
+            <div class="report-link-item">
+                <div class="report-link-rank">${index + 1}</div>
+                <div class="report-link-name">${item.linkName}</div>
+                <div class="report-link-stats">
+                    <div class="report-link-stat">
+                        <div class="stat-num">${item.totalPartitionIncrease}</div>
+                        <div>分区增加</div>
+                    </div>
+                    <div class="report-link-stat">
+                        <div class="stat-num">${item.totalPauseIncrease}</div>
+                        <div>流量中断</div>
+                    </div>
+                </div>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
+}
+
+function renderResilienceTimeline() {
+    const samples = currentResilienceReport.timelineSamples;
+    const events = [...currentPlaybookEvents].sort((a, b) => a.time - b.time);
+    const container = document.getElementById('resilienceTimeline');
+
+    if (samples.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">无数据</p>';
+        return;
+    }
+
+    let html = '<div class="resilience-timeline">';
+
+    let eventIndex = 0;
+
+    for (let i = 0; i < samples.length; i++) {
+        const sample = samples[i];
+
+        while (eventIndex < events.length && events[eventIndex].time <= sample.time) {
+            const event = events[eventIndex];
+            const link = links.find(l => l.id === event.linkId);
+            const linkName = link ? getLinkName(link) : '未知';
+
+            html += `
+                <div class="timeline-item event">
+                    <div class="timeline-time">${event.time.toFixed(1)}s</div>
+                    <div class="timeline-content">
+                        <span class="event-type ${event.action}">${event.action === 'break' ? '断开' : '恢复'}</span>
+                        ${linkName}
+                    </div>
+                </div>
+            `;
+            eventIndex++;
+        }
+
+        if (i % 5 === 0 || i === samples.length - 1) {
+            html += `
+                <div class="timeline-item">
+                    <div class="timeline-time">${sample.time.toFixed(1)}s</div>
+                    <div class="timeline-content">
+                        采样点
+                    </div>
+                    <div class="timeline-stats">
+                        <span>分区: ${sample.partitionCount}</span>
+                        <span>不可达对: ${sample.unreachablePairs}</span>
+                        <span>暂停流: ${sample.pausedFlowCount}</span>
+                    </div>
+                </div>
+            `;
+        }
+    }
+
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+function renderRecoverySpeeds() {
+    const speeds = currentResilienceReport.recoverySpeeds;
+    const container = document.getElementById('resilienceRecoverySpeeds');
+
+    if (speeds.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">无恢复事件</p>';
+        return;
+    }
+
+    let html = '';
+    speeds.forEach(item => {
+        html += `
+            <div class="recovery-item">
+                <div class="recovery-link-name">${item.linkName}</div>
+                <div class="recovery-time">${item.recoveryTime.toFixed(2)}<span class="unit">s</span></div>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
+}
+
+async function saveResilienceReportToBackend(report) {
+    try {
+        await apiRequest('/resilience-reports', {
+            method: 'POST',
+            body: JSON.stringify(report)
+        });
+    } catch (err) {
+        console.error('保存报告失败:', err);
+    }
+}
+
+async function loadResilienceReportHistory() {
+    try {
+        const result = await apiRequest('/resilience-reports');
+        if (result.success) {
+            renderResilienceReportHistory(result.data);
+        }
+    } catch (err) {
+        console.error('加载历史报告失败:', err);
+    }
+}
+
+function renderResilienceReportHistory(reports) {
+    const container = document.getElementById('resilienceReportHistoryList');
+
+    if (reports.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">暂无历史报告</p>';
+        return;
+    }
+
+    let html = '';
+    reports.forEach(report => {
+        const date = new Date(report.timestamp);
+        const dateStr = date.toLocaleString('zh-CN');
+
+        html += `
+            <div class="history-item" onclick="viewResilienceReport(${report.id})">
+                <div class="history-item-name">${report.playbookName}</div>
+                <div class="history-item-meta">
+                    <span class="history-item-status ${report.status}">
+                        ${report.status === 'completed' ? '已完成' : '已终止'}
+                    </span>
+                    <span>${dateStr}</span>
+                </div>
+                <div class="history-item-meta" style="margin-top:4px;">
+                    <span>最大分区: ${report.maxPartitionCount}</span>
+                    <span>${report.totalDuration.toFixed(1)}s</span>
+                </div>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
+}
+
+async function viewResilienceReport(reportId) {
+    try {
+        const result = await apiRequest('/resilience-reports/' + reportId);
+        if (result.success && result.data) {
+            currentResilienceReport = result.data;
+
+            if (result.data.playbookId) {
+                const playbookResult = await apiRequest('/fault-playbooks/' + result.data.playbookId);
+                if (playbookResult.success && playbookResult.data) {
+                    currentPlaybookEvents = playbookResult.data.events || [];
+                }
+            }
+
+            switchPlaybookTab('editor');
+            renderResilienceReport();
+        }
+    } catch (err) {
+        alert('加载报告详情失败: ' + err.message);
+    }
+}
+
+function exportResilienceReport() {
+    if (!currentResilienceReport) return;
+
+    const dataStr = JSON.stringify(currentResilienceReport, null, 2);
+    const dataBlob = new Blob([dataStr], { type: 'application/json' });
+
+    const url = URL.createObjectURL(dataBlob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `resilience-report-${currentResilienceReport.playbookName}-${Date.now()}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+}
+
+function initFaultPlaybookModule() {
+    document.getElementById('newPlaybookBtn').addEventListener('click', newPlaybook);
+    document.getElementById('deletePlaybookBtn').addEventListener('click', deletePlaybook);
+    document.getElementById('addEventBtn').addEventListener('click', addPlaybookEvent);
+    document.getElementById('savePlaybookBtn').addEventListener('click', savePlaybook);
+    document.getElementById('playbookSelect').addEventListener('change', onPlaybookSelectChange);
+
+    document.getElementById('playPlaybookBtn').addEventListener('click', startPlayback);
+    document.getElementById('pausePlaybackBtn').addEventListener('click', pausePlayback);
+    document.getElementById('resumePlaybackBtn').addEventListener('click', resumePlayback);
+    document.getElementById('stopPlaybackBtn').addEventListener('click', stopPlayback);
+
+    document.getElementById('exportResilienceReportBtn').addEventListener('click', exportResilienceReport);
+    document.getElementById('refreshReportHistoryBtn').addEventListener('click', loadResilienceReportHistory);
+
+    document.querySelectorAll('.playbook-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            switchPlaybookTab(tab.dataset.playbookTab);
+        });
+    });
+
+    loadFaultPlaybooks();
+}
+
+window.newPlaybook = newPlaybook;
+window.deletePlaybook = deletePlaybook;
+window.addPlaybookEvent = addPlaybookEvent;
+window.updateEventTime = updateEventTime;
+window.updateEventLink = updateEventLink;
+window.toggleEventAction = toggleEventAction;
+window.deletePlaybookEvent = deletePlaybookEvent;
+window.viewResilienceReport = viewResilienceReport;
+
 init();
 
 initMigrationModule();
+
+initFaultPlaybookModule();

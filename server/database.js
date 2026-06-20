@@ -219,6 +219,53 @@ function initDatabase() {
       db.run(`
         CREATE INDEX IF NOT EXISTS idx_migration_flows_task_id 
         ON migration_flows(task_id)
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS fault_playbooks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          description TEXT,
+          event_count INTEGER NOT NULL DEFAULT 0,
+          total_duration REAL NOT NULL DEFAULT 0,
+          events TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_fault_playbooks_created 
+        ON fault_playbooks(created_at DESC)
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS resilience_reports (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          playbook_id INTEGER,
+          playbook_name TEXT NOT NULL,
+          status TEXT NOT NULL,
+          total_duration REAL NOT NULL,
+          total_events INTEGER NOT NULL,
+          triggered_events INTEGER NOT NULL,
+          max_partition_count INTEGER NOT NULL,
+          longest_disconnect_duration REAL NOT NULL,
+          total_disconnect_duration REAL NOT NULL,
+          link_resilience_ranking TEXT NOT NULL,
+          timeline_samples TEXT NOT NULL,
+          recovery_speeds TEXT NOT NULL,
+          sla_breach_count INTEGER NOT NULL DEFAULT 0,
+          paused_flow_count INTEGER NOT NULL DEFAULT 0,
+          unreachable_pair_count INTEGER NOT NULL DEFAULT 0,
+          pre_topology_snapshot TEXT,
+          post_topology_snapshot TEXT,
+          timestamp INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_resilience_reports_timestamp 
+        ON resilience_reports(timestamp DESC)
       `, (err) => {
         if (err) reject(err);
         else resolve();
@@ -1518,6 +1565,260 @@ function listSlaEvents(filters) {
   });
 }
 
+const MAX_FAULT_PLAYBOOKS = 5;
+
+function saveFaultPlaybook(playbookData) {
+  return new Promise((resolve, reject) => {
+    const { id, name, description, events } = playbookData;
+    const now = Date.now();
+
+    const eventCount = events ? events.length : 0;
+    const totalDuration = events && events.length > 0 
+      ? Math.max(...events.map(e => e.time || 0)) 
+      : 0;
+
+    if (id) {
+      const stmt = db.prepare(`
+        UPDATE fault_playbooks 
+        SET name = ?, description = ?, event_count = ?, total_duration = ?, events = ?, updated_at = ?
+        WHERE id = ?
+      `);
+      stmt.run(
+        name,
+        description || null,
+        eventCount,
+        totalDuration,
+        JSON.stringify(events || []),
+        now,
+        id,
+        function(err) {
+          if (err) return reject(err);
+          resolve({
+            id,
+            name,
+            description,
+            eventCount,
+            totalDuration,
+            updatedAt: now
+          });
+        }
+      );
+    } else {
+      db.get('SELECT COUNT(*) as count FROM fault_playbooks', (err, countRow) => {
+        if (err) return reject(err);
+
+        const currentCount = countRow.count;
+
+        const deleteOldIfNeeded = () => {
+          return new Promise((res, rej) => {
+            if (currentCount >= MAX_FAULT_PLAYBOOKS) {
+              const toDelete = currentCount - MAX_FAULT_PLAYBOOKS + 1;
+              db.run(`
+                DELETE FROM fault_playbooks 
+                WHERE id IN (
+                  SELECT id FROM fault_playbooks 
+                  ORDER BY created_at ASC 
+                  LIMIT ?
+                )
+              `, [toDelete], (err) => {
+                if (err) rej(err);
+                else res();
+              });
+            } else {
+              res();
+            }
+          });
+        };
+
+        deleteOldIfNeeded()
+          .then(() => {
+            const stmt = db.prepare(`
+              INSERT INTO fault_playbooks 
+                (name, description, event_count, total_duration, events, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+            `);
+            stmt.run(
+              name,
+              description || null,
+              eventCount,
+              totalDuration,
+              JSON.stringify(events || []),
+              now,
+              now,
+              function(err) {
+                if (err) return reject(err);
+                resolve({
+                  id: this.lastID,
+                  name,
+                  description,
+                  eventCount,
+                  totalDuration,
+                  createdAt: now,
+                  updatedAt: now
+                });
+              }
+            );
+          })
+          .catch(reject);
+      });
+    }
+  });
+}
+
+function listFaultPlaybooks() {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT id, name, description, event_count, total_duration, created_at, updated_at
+      FROM fault_playbooks 
+      ORDER BY created_at DESC
+    `, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        description: row.description,
+        eventCount: row.event_count,
+        totalDuration: row.total_duration,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      })));
+    });
+  });
+}
+
+function getFaultPlaybook(playbookId) {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT * FROM fault_playbooks WHERE id = ?`, [playbookId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+
+      resolve({
+        id: row.id,
+        name: row.name,
+        description: row.description,
+        eventCount: row.event_count,
+        totalDuration: row.total_duration,
+        events: JSON.parse(row.events),
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      });
+    });
+  });
+}
+
+function deleteFaultPlaybook(playbookId) {
+  return new Promise((resolve, reject) => {
+    db.run('DELETE FROM fault_playbooks WHERE id = ?', [playbookId], function(err) {
+      if (err) return reject(err);
+      resolve({ deleted: this.changes });
+    });
+  });
+}
+
+function saveResilienceReport(reportData) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`
+      INSERT INTO resilience_reports (
+        playbook_id, playbook_name, status, total_duration, total_events,
+        triggered_events, max_partition_count, longest_disconnect_duration,
+        total_disconnect_duration, link_resilience_ranking, timeline_samples,
+        recovery_speeds, sla_breach_count, paused_flow_count,
+        unreachable_pair_count, pre_topology_snapshot, post_topology_snapshot, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(
+      reportData.playbookId || null,
+      reportData.playbookName,
+      reportData.status || 'completed',
+      reportData.totalDuration || 0,
+      reportData.totalEvents || 0,
+      reportData.triggeredEvents || 0,
+      reportData.maxPartitionCount || 1,
+      reportData.longestDisconnectDuration || 0,
+      reportData.totalDisconnectDuration || 0,
+      JSON.stringify(reportData.linkResilienceRanking || []),
+      JSON.stringify(reportData.timelineSamples || []),
+      JSON.stringify(reportData.recoverySpeeds || []),
+      reportData.slaBreachCount || 0,
+      reportData.pausedFlowCount || 0,
+      reportData.unreachablePairCount || 0,
+      reportData.preTopologySnapshot ? JSON.stringify(reportData.preTopologySnapshot) : null,
+      reportData.postTopologySnapshot ? JSON.stringify(reportData.postTopologySnapshot) : null,
+      reportData.timestamp || Date.now(),
+      function(err) {
+        if (err) return reject(err);
+        resolve({
+          id: this.lastID,
+          playbookName: reportData.playbookName,
+          status: reportData.status,
+          totalDuration: reportData.totalDuration,
+          timestamp: reportData.timestamp || Date.now()
+        });
+      }
+    );
+  });
+}
+
+function listResilienceReports() {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT 
+        id, playbook_id, playbook_name, status, total_duration, 
+        total_events, triggered_events, max_partition_count,
+        sla_breach_count, timestamp
+      FROM resilience_reports 
+      ORDER BY timestamp DESC
+      LIMIT 30
+    `, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        playbookId: row.playbook_id,
+        playbookName: row.playbook_name,
+        status: row.status,
+        totalDuration: row.total_duration,
+        totalEvents: row.total_events,
+        triggeredEvents: row.triggered_events,
+        maxPartitionCount: row.max_partition_count,
+        slaBreachCount: row.sla_breach_count,
+        timestamp: row.timestamp
+      })));
+    });
+  });
+}
+
+function getResilienceReport(reportId) {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT * FROM resilience_reports WHERE id = ?`, [reportId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+
+      resolve({
+        id: row.id,
+        playbookId: row.playbook_id,
+        playbookName: row.playbook_name,
+        status: row.status,
+        totalDuration: row.total_duration,
+        totalEvents: row.total_events,
+        triggeredEvents: row.triggered_events,
+        maxPartitionCount: row.max_partition_count,
+        longestDisconnectDuration: row.longest_disconnect_duration,
+        totalDisconnectDuration: row.total_disconnect_duration,
+        linkResilienceRanking: JSON.parse(row.link_resilience_ranking),
+        timelineSamples: JSON.parse(row.timeline_samples),
+        recoverySpeeds: JSON.parse(row.recovery_speeds),
+        slaBreachCount: row.sla_breach_count,
+        pausedFlowCount: row.paused_flow_count,
+        unreachablePairCount: row.unreachable_pair_count,
+        preTopologySnapshot: row.pre_topology_snapshot ? JSON.parse(row.pre_topology_snapshot) : null,
+        postTopologySnapshot: row.post_topology_snapshot ? JSON.parse(row.post_topology_snapshot) : null,
+        timestamp: row.timestamp
+      });
+    });
+  });
+}
+
 module.exports = {
   initDatabase,
   saveTopology,
@@ -1550,5 +1851,12 @@ module.exports = {
   updateMigrationBatch,
   updateMigrationFlow,
   deleteMigrationTask,
-  duplicateMigrationTask
+  duplicateMigrationTask,
+  saveFaultPlaybook,
+  listFaultPlaybooks,
+  getFaultPlaybook,
+  deleteFaultPlaybook,
+  saveResilienceReport,
+  listResilienceReports,
+  getResilienceReport
 };

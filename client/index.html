@@ -519,6 +519,116 @@
                     </p>
                 </div>
             </div>
+
+            <h3>故障剧本编辑</h3>
+            <div class="fault-playbook-panel">
+                <div class="playbook-tabs">
+                    <button class="playbook-tab active" data-playbook-tab="editor">剧本编辑</button>
+                    <button class="playbook-tab" data-playbook-tab="history">历史报告</button>
+                </div>
+
+                <div class="playbook-tab-content" id="playbook-tab-editor">
+                    <div class="playbook-selector">
+                        <select id="playbookSelect">
+                            <option value="">-- 选择/新建 --</option>
+                        </select>
+                        <button id="newPlaybookBtn" class="btn btn-small btn-primary">新建</button>
+                        <button id="deletePlaybookBtn" class="btn btn-small btn-danger" style="display:none;">删除</button>
+                    </div>
+                    <div class="playbook-info" id="playbookInfo" style="display:none;">
+                        <div class="form-group">
+                            <label>剧本名称</label>
+                            <input type="text" id="playbookName" placeholder="输入剧本名称">
+                        </div>
+                        <div class="form-group">
+                            <label>描述</label>
+                            <input type="text" id="playbookDesc" placeholder="可选，简要描述">
+                        </div>
+                    </div>
+                    <div class="playbook-events-section" id="playbookEventsSection" style="display:none;">
+                        <div class="playbook-events-header">
+                            <span>故障事件</span>
+                            <button id="addEventBtn" class="btn btn-small btn-primary">添加事件</button>
+                        </div>
+                        <div class="playbook-events-list" id="playbookEventsList">
+                            <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无事件，点击"添加事件"开始编排</p>
+                        </div>
+                        <div class="playbook-actions">
+                            <button id="savePlaybookBtn" class="btn btn-primary" style="width:100%;">保存剧本</button>
+                        </div>
+                    </div>
+                    <div class="playbook-empty" id="playbookEmpty">
+                        <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">
+                            选择或新建一个剧本开始编排
+                        </p>
+                    </div>
+                </div>
+
+                <div class="playbook-tab-content" id="playbook-tab-history" style="display:none;">
+                    <div class="history-header">
+                        <button id="refreshReportHistoryBtn" class="btn btn-small">刷新列表</button>
+                    </div>
+                    <div class="history-list" id="resilienceReportHistoryList">
+                        <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">暂无历史报告</p>
+                    </div>
+                </div>
+            </div>
+
+            <h3>剧本播放控制</h3>
+            <div class="playback-control-panel">
+                <div class="playback-status" id="playbackStatus">
+                    <span class="playback-status-indicator" id="playbackStatusIndicator"></span>
+                    <span class="playback-status-text" id="playbackStatusText">未播放</span>
+                </div>
+                <div class="playback-progress">
+                    <div class="playback-progress-bar">
+                        <div class="playback-progress-fill" id="playbackProgressFill"></div>
+                    </div>
+                    <div class="playback-progress-text">
+                        <span id="playbackEventProgress">0/0 事件</span>
+                        <span id="playbackTimeProgress">0.0s</span>
+                    </div>
+                </div>
+                <div class="playback-controls">
+                    <button id="playPlaybookBtn" class="btn btn-primary" style="flex:1;">▶ 播放</button>
+                    <button id="pausePlaybackBtn" class="btn" style="flex:1;display:none;">⏸ 暂停</button>
+                    <button id="resumePlaybackBtn" class="btn btn-primary" style="flex:1;display:none;">▶ 继续</button>
+                    <button id="stopPlaybackBtn" class="btn btn-danger" style="flex:1;display:none;">■ 终止</button>
+                </div>
+            </div>
+
+            <h3>韧性评估报告</h3>
+            <div class="resilience-report-panel">
+                <div class="resilience-report-empty" id="resilienceReportEmpty">
+                    <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">
+                        运行故障剧本后自动生成报告
+                    </p>
+                </div>
+                <div class="resilience-report-container" id="resilienceReportContainer" style="display:none;">
+                    <div class="resilience-report-header">
+                        <span id="resilienceReportTitle">韧性评估报告</span>
+                        <button id="exportResilienceReportBtn" class="btn btn-small">导出JSON</button>
+                    </div>
+                    <div class="resilience-report-content">
+                        <div class="report-section">
+                            <h4>总览</h4>
+                            <div class="report-stats" id="resilienceOverviewStats"></div>
+                        </div>
+                        <div class="report-section">
+                            <h4>链路韧性排名</h4>
+                            <div class="report-links" id="resilienceLinkRanking"></div>
+                        </div>
+                        <div class="report-section">
+                            <h4>时间线</h4>
+                            <div class="resilience-timeline" id="resilienceTimeline"></div>
+                        </div>
+                        <div class="report-section">
+                            <h4>恢复速度</h4>
+                            <div class="resilience-recovery" id="resilienceRecoverySpeeds"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
