@@ -7795,6 +7795,8 @@ function startPlayback() {
     playbackState.totalEvents = sortedEvents.length;
 
     resilienceSamples = [];
+    
+    stopSampling();
 
     updatePlaybackUI();
     updatePlayButtonState();
@@ -8025,7 +8027,7 @@ function sampleResilienceState() {
 
     let pausedFlowCount = 0;
     trafficFlows.forEach(flow => {
-        if (flow.status === 'paused' || flow.status === 'unreachable') {
+        if (flow.paused) {
             pausedFlowCount++;
         }
     });
@@ -8126,21 +8128,68 @@ function generateResilienceReport(status) {
 function calculateLinkResilienceRanking() {
     const linkImpacts = new Map();
 
-    const sortedEvents = [...currentPlaybookEvents]
+    const breakEvents = [...currentPlaybookEvents]
         .filter(e => e.action === 'break')
         .sort((a, b) => a.time - b.time);
 
-    let prevPartitions = 1;
-    let prevPausedFlows = 0;
+    if (breakEvents.length === 0) return [];
 
-    sortedEvents.forEach(event => {
-        const link = links.find(l => l.id === event.linkId);
-        if (!link) return;
+    function findSampleBeforeOrAt(time) {
+        let result = null;
+        for (const s of resilienceSamples) {
+            if (s.time <= time) {
+                result = s;
+            } else {
+                break;
+            }
+        }
+        return result;
+    }
 
-        const eventSample = resilienceSamples.find(s => s.time >= event.time);
-        if (eventSample) {
-            const partitionIncrease = eventSample.partitionCount - prevPartitions;
-            const pausedFlowIncrease = eventSample.pausedFlowCount - prevPausedFlows;
+    function findSampleAfter(time) {
+        for (const s of resilienceSamples) {
+            if (s.time > time) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    const groupedEvents = new Map();
+    breakEvents.forEach(event => {
+        const afterSample = findSampleAfter(event.time);
+        const groupKey = afterSample ? afterSample.time : 'end';
+        if (!groupedEvents.has(groupKey)) {
+            groupedEvents.set(groupKey, {
+                events: [],
+                preSample: findSampleBeforeOrAt(event.time),
+                postSample: afterSample
+            });
+        }
+        groupedEvents.get(groupKey).events.push(event);
+    });
+
+    groupedEvents.forEach(group => {
+        const { events: groupEvents, preSample, postSample } = group;
+        if (!postSample) return;
+
+        const prePartitions = preSample ? preSample.partitionCount : 1;
+        const prePausedFlows = preSample ? preSample.pausedFlowCount : 0;
+        const postPartitions = postSample.partitionCount;
+        const postPausedFlows = postSample.pausedFlowCount;
+
+        const totalPartitionIncrease = Math.max(0, postPartitions - prePartitions);
+        const totalPauseIncrease = Math.max(0, postPausedFlows - prePausedFlows);
+
+        const eventCount = groupEvents.length;
+        if (eventCount === 0) return;
+
+        const avgPartitionIncrease = totalPartitionIncrease / eventCount;
+        const avgPauseIncrease = totalPauseIncrease / eventCount;
+
+        groupEvents.forEach(event => {
+            const link = links.find(l => l.id === event.linkId);
+            if (!link) return;
 
             const linkName = getLinkName(link);
             if (!linkImpacts.has(event.linkId)) {
@@ -8156,15 +8205,12 @@ function calculateLinkResilienceRanking() {
             }
 
             const impact = linkImpacts.get(event.linkId);
-            impact.totalPartitionIncrease += Math.max(0, partitionIncrease);
-            impact.maxPartitionIncrease = Math.max(impact.maxPartitionIncrease, partitionIncrease);
-            impact.totalPauseIncrease += Math.max(0, pausedFlowIncrease);
-            impact.maxPauseIncrease = Math.max(impact.maxPauseIncrease, pausedFlowIncrease);
+            impact.totalPartitionIncrease += avgPartitionIncrease;
+            impact.maxPartitionIncrease = Math.max(impact.maxPartitionIncrease, avgPartitionIncrease);
+            impact.totalPauseIncrease += avgPauseIncrease;
+            impact.maxPauseIncrease = Math.max(impact.maxPauseIncrease, avgPauseIncrease);
             impact.breakCount++;
-
-            prevPartitions = eventSample.partitionCount;
-            prevPausedFlows = eventSample.pausedFlowCount;
-        }
+        });
     });
 
     const ranking = Array.from(linkImpacts.values()).sort((a, b) => {
@@ -8190,19 +8236,12 @@ function calculateRecoverySpeeds() {
         const recoveryStartTime = event.time;
 
         let fullyRecoveredTime = null;
-        let initialPausedCount = 0;
 
         for (let i = 0; i < resilienceSamples.length; i++) {
             const sample = resilienceSamples[i];
 
             if (sample.time >= recoveryStartTime) {
-                if (fullyRecoveredTime === null) {
-                    const startSample = resilienceSamples.find(s => s.time >= recoveryStartTime);
-                    initialPausedCount = startSample ? startSample.pausedFlowCount : 0;
-                }
-
-                if (sample.pausedFlowCount <= Math.max(0, initialPausedCount - 1) || 
-                    sample.partitionCount <= 1) {
+                if (sample.partitionCount <= 1 && sample.pausedFlowCount === 0) {
                     fullyRecoveredTime = sample.time;
                     break;
                 }
