@@ -41,7 +41,10 @@ const {
   deleteFaultPlaybook,
   saveResilienceReport,
   listResilienceReports,
-  getResilienceReport
+  getResilienceReport,
+  saveCapacitySimulation,
+  listCapacitySimulations,
+  getCapacitySimulation
 } = require('./database');
 
 const app = express();
@@ -824,6 +827,61 @@ app.get('/api/resilience-reports/:id', async (req, res) => {
   } catch (err) {
     console.error('获取韧性评估报告详情失败:', err);
     res.status(500).json({ error: '获取详情失败' });
+  }
+});
+
+app.post('/api/capacity-simulations', async (req, res) => {
+  try {
+    const simData = req.body;
+
+    if (simData.growthMultiplier === undefined || simData.growthMultiplier === null) {
+      return res.status(400).json({ error: '缺少必要字段: growthMultiplier' });
+    }
+
+    const result = await saveCapacitySimulation(simData);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存容量模拟失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/capacity-simulations', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const simulations = await listCapacitySimulations(limit);
+    res.json({
+      success: true,
+      data: simulations
+    });
+  } catch (err) {
+    console.error('获取容量模拟列表失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.get('/api/capacity-simulations/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的模拟ID' });
+    }
+
+    const simulation = await getCapacitySimulation(id);
+    if (!simulation) {
+      return res.status(404).json({ error: '模拟记录不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: simulation
+    });
+  } catch (err) {
+    console.error('获取容量模拟失败:', err);
+    res.status(500).json({ error: '获取失败' });
   }
 });
 

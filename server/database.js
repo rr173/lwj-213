@@ -266,6 +266,29 @@ function initDatabase() {
       db.run(`
         CREATE INDEX IF NOT EXISTS idx_resilience_reports_timestamp 
         ON resilience_reports(timestamp DESC)
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS capacity_simulations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          growth_multiplier REAL NOT NULL,
+          overloaded_links TEXT NOT NULL,
+          warning_links TEXT NOT NULL,
+          sla_violations_current INTEGER NOT NULL DEFAULT 0,
+          sla_violations_simulated INTEGER NOT NULL DEFAULT 0,
+          expansion_plan_name TEXT,
+          expansion_plan_data TEXT,
+          bottleneck_link_id INTEGER,
+          bottleneck_link_name TEXT,
+          recommended_bandwidths TEXT,
+          topology_snapshot TEXT,
+          timestamp INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_capacity_simulations_timestamp 
+        ON capacity_simulations(timestamp DESC)
       `, (err) => {
         if (err) reject(err);
         else resolve();
@@ -1819,6 +1842,100 @@ function getResilienceReport(reportId) {
   });
 }
 
+const MAX_CAPACITY_SIMULATIONS = 50;
+
+function saveCapacitySimulation(simData) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`
+      INSERT INTO capacity_simulations (
+        growth_multiplier, overloaded_links, warning_links,
+        sla_violations_current, sla_violations_simulated,
+        expansion_plan_name, expansion_plan_data,
+        bottleneck_link_id, bottleneck_link_name,
+        recommended_bandwidths, topology_snapshot, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(
+      simData.growthMultiplier,
+      JSON.stringify(simData.overloadedLinks || []),
+      JSON.stringify(simData.warningLinks || []),
+      simData.slaViolationsCurrent || 0,
+      simData.slaViolationsSimulated || 0,
+      simData.expansionPlanName || null,
+      simData.expansionPlanData ? JSON.stringify(simData.expansionPlanData) : null,
+      simData.bottleneckLinkId || null,
+      simData.bottleneckLinkName || null,
+      JSON.stringify(simData.recommendedBandwidths || []),
+      simData.topologySnapshot ? JSON.stringify(simData.topologySnapshot) : null,
+      simData.timestamp || Date.now(),
+      function(err) {
+        if (err) return reject(err);
+        resolve({
+          id: this.lastID,
+          growthMultiplier: simData.growthMultiplier,
+          timestamp: simData.timestamp || Date.now()
+        });
+      }
+    );
+  });
+}
+
+function listCapacitySimulations(limit) {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT id, growth_multiplier, overloaded_links, warning_links,
+             sla_violations_current, sla_violations_simulated,
+             expansion_plan_name, bottleneck_link_id, bottleneck_link_name,
+             timestamp
+      FROM capacity_simulations 
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `, [limit || 50], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        growthMultiplier: row.growth_multiplier,
+        overloadedLinks: JSON.parse(row.overloaded_links),
+        warningLinks: JSON.parse(row.warning_links),
+        slaViolationsCurrent: row.sla_violations_current,
+        slaViolationsSimulated: row.sla_violations_simulated,
+        expansionPlanName: row.expansion_plan_name,
+        bottleneckLinkId: row.bottleneck_link_id,
+        bottleneckLinkName: row.bottleneck_link_name,
+        timestamp: row.timestamp
+      })));
+    });
+  });
+}
+
+function getCapacitySimulation(simId) {
+  return new Promise((resolve, reject) => {
+    db.get(`
+      SELECT * FROM capacity_simulations WHERE id = ?
+    `, [simId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+
+      resolve({
+        id: row.id,
+        growthMultiplier: row.growth_multiplier,
+        overloadedLinks: JSON.parse(row.overloaded_links),
+        warningLinks: JSON.parse(row.warning_links),
+        slaViolationsCurrent: row.sla_violations_current,
+        slaViolationsSimulated: row.sla_violations_simulated,
+        expansionPlanName: row.expansion_plan_name,
+        expansionPlanData: row.expansion_plan_data ? JSON.parse(row.expansion_plan_data) : null,
+        bottleneckLinkId: row.bottleneck_link_id,
+        bottleneckLinkName: row.bottleneck_link_name,
+        recommendedBandwidths: JSON.parse(row.recommended_bandwidths),
+        topologySnapshot: row.topology_snapshot ? JSON.parse(row.topology_snapshot) : null,
+        timestamp: row.timestamp
+      });
+    });
+  });
+}
+
 module.exports = {
   initDatabase,
   saveTopology,
@@ -1858,5 +1975,8 @@ module.exports = {
   deleteFaultPlaybook,
   saveResilienceReport,
   listResilienceReports,
-  getResilienceReport
+  getResilienceReport,
+  saveCapacitySimulation,
+  listCapacitySimulations,
+  getCapacitySimulation
 };

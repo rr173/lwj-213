@@ -8538,3 +8538,733 @@ init();
 initMigrationModule();
 
 initFaultPlaybookModule();
+
+let capacityExpansionPlans = [];
+let capacityPlanIdCounter = 1;
+let lastCapacitySimResult = null;
+
+function initCapacityPlanningModule() {
+    document.getElementById('openCapacityModalBtn').addEventListener('click', openCapacityModal);
+    document.getElementById('closeCapacityModal').addEventListener('click', closeCapacityModal);
+
+    document.querySelectorAll('.capacity-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            switchCapacityTab(tab.dataset.capacityTab);
+        });
+    });
+
+    const multiplierInput = document.getElementById('capacityMultiplier');
+    const multiplierDisplay = document.getElementById('capacityMultiplierValue');
+    multiplierInput.addEventListener('input', () => {
+        multiplierDisplay.textContent = parseFloat(multiplierInput.value).toFixed(1) + 'x';
+    });
+
+    document.getElementById('runCapacitySimBtn').addEventListener('click', runCapacitySimulation);
+    document.getElementById('saveCapacityPlanBtn').addEventListener('click', saveCapacityPlan);
+    document.getElementById('runCapacityCompareBtn').addEventListener('click', runCapacityCompare);
+    document.getElementById('refreshCapacityHistoryBtn').addEventListener('click', loadCapacityHistory);
+
+    loadCapacityExpansionPlansFromStorage();
+}
+
+function openCapacityModal() {
+    document.getElementById('capacityModal').style.display = 'block';
+    refreshCapacityPlanSelects();
+    refreshCapacityPlanLinkList();
+    refreshCapacityPlanSavedList();
+    loadCapacityHistory();
+}
+
+function closeCapacityModal() {
+    document.getElementById('capacityModal').style.display = 'none';
+}
+
+function switchCapacityTab(tabName) {
+    document.querySelectorAll('.capacity-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.capacityTab === tabName);
+    });
+    document.querySelectorAll('.capacity-tab-content').forEach(content => {
+        content.style.display = 'none';
+    });
+    const target = document.getElementById('capacity-tab-' + tabName);
+    if (target) target.style.display = 'block';
+
+    if (tabName === 'expansion') {
+        refreshCapacityPlanLinkList();
+        refreshCapacityPlanSavedList();
+    }
+    if (tabName === 'compare') {
+        refreshCapacityPlanSelects();
+    }
+}
+
+function calculateSimulatedLinkLoads(multiplier, planOverrides) {
+    const overrides = planOverrides || {};
+    const result = new Map();
+
+    links.forEach(link => {
+        if (!link.enabled) return;
+
+        let totalRate = 0;
+        trafficFlows.forEach(flow => {
+            if (flow.path && flow.path.segments && flow.path.segments.some(seg =>
+                (seg.from === link.from && seg.to === link.to) ||
+                (seg.from === link.to && seg.to === link.from)
+            )) {
+                totalRate += (flow.actualRate || flow.rate) * multiplier;
+            }
+        });
+
+        const effectiveBandwidth = overrides[link.id] !== undefined ? overrides[link.id] : link.bandwidth;
+        const loadRate = totalRate / (effectiveBandwidth * 1000000);
+
+        result.set(link.id, {
+            linkId: link.id,
+            linkName: getLinkDisplayName(link.id),
+            currentBandwidth: link.bandwidth,
+            effectiveBandwidth: effectiveBandwidth,
+            loadRate: loadRate,
+            usedMbps: totalRate,
+            from: link.from,
+            to: link.to
+        });
+    });
+
+    return result;
+}
+
+function calculateSimulatedSlaViolations(multiplier, planOverrides) {
+    const overrides = planOverrides || {};
+    let violationCount = 0;
+    const violatingContracts = [];
+
+    slaContracts.forEach(contract => {
+        if (!contract.monitoring) return;
+
+        const path = getPath(contract.srcDeviceId, contract.dstDeviceId);
+        if (!path || !path.segments || path.segments.length === 0) {
+            violationCount++;
+            violatingContracts.push({ name: contract.name, reason: '不可达' });
+            return;
+        }
+
+        let latency = 0;
+        path.segments.forEach(seg => { latency += seg.link.delay; });
+
+        let passThroughProduct = 1;
+        path.segments.forEach(seg => {
+            const congestionState = congestionStates.get(seg.link.id);
+            const simLoad = (getLinkLoad(seg.link.id)) * multiplier;
+            if ((congestionState && congestionState.packetLossActive) || simLoad > 0.8) {
+                passThroughProduct *= (1 - 0.2);
+            }
+        });
+        const lossRate = (1 - passThroughProduct) * 100;
+
+        let availableBandwidth = Infinity;
+        path.segments.forEach(seg => {
+            const link = seg.link;
+            const effectiveBandwidth = overrides[link.id] !== undefined ? overrides[link.id] : link.bandwidth;
+            const currentLoad = getLinkLoad(link.id);
+            const simLoadRate = currentLoad * multiplier;
+            const usedBw = simLoadRate * effectiveBandwidth;
+            const remaining = effectiveBandwidth - usedBw;
+            if (remaining < availableBandwidth) {
+                availableBandwidth = remaining;
+            }
+        });
+
+        const isViolating = latency > contract.maxLatency ||
+            lossRate > contract.maxLossRate ||
+            availableBandwidth < contract.minBandwidth;
+
+        if (isViolating) {
+            violationCount++;
+            const reasons = [];
+            if (latency > contract.maxLatency) reasons.push('延迟');
+            if (lossRate > contract.maxLossRate) reasons.push('丢包');
+            if (availableBandwidth < contract.minBandwidth) reasons.push('带宽');
+            violatingContracts.push({ name: contract.name, reasons });
+        }
+    });
+
+    return { violationCount, violatingContracts };
+}
+
+function getCurrentSlaViolationCount() {
+    return slaContracts.filter(c => c.isViolating).length;
+}
+
+function findBottleneckLink(linkLoadMap) {
+    const overloaded = [];
+    linkLoadMap.forEach(info => {
+        if (info.loadRate > 1.0) overloaded.push(info);
+    });
+
+    if (overloaded.length === 0) return null;
+    if (overloaded.length === 1) return overloaded[0];
+
+    let bestLink = null;
+    let bestResolved = -1;
+
+    overloaded.forEach(candidate => {
+        const neededBw = candidate.usedMbps / 0.8 / 1000000;
+        const overrides = {};
+        overrides[candidate.linkId] = neededBw;
+
+        const simLoads = calculateSimulatedLinkLoads(
+            parseFloat(document.getElementById('capacityMultiplier').value),
+            overrides
+        );
+
+        let resolvedCount = 0;
+        overloaded.forEach(overloadedInfo => {
+            const simInfo = simLoads.get(overloadedInfo.linkId);
+            if (simInfo && simInfo.loadRate <= 0.8) resolvedCount++;
+        });
+
+        if (resolvedCount > bestResolved) {
+            bestResolved = resolvedCount;
+            bestLink = candidate;
+        }
+    });
+
+    if (!bestLink) bestLink = overloaded[0];
+    return bestLink;
+}
+
+function calculateRecommendedBandwidths(linkLoadMap) {
+    const recommendations = [];
+    linkLoadMap.forEach(info => {
+        if (info.loadRate > 1.0) {
+            const recommendedBw = Math.ceil((info.usedMbps / 0.8 / 1000000) * 10) / 10;
+            recommendations.push({
+                linkId: info.linkId,
+                linkName: info.linkName,
+                currentBandwidth: info.currentBandwidth,
+                recommendedBandwidth: Math.max(recommendedBw, info.currentBandwidth + 0.1),
+                simulatedLoadRate: info.loadRate,
+                usedMbps: info.usedMbps
+            });
+        }
+    });
+    recommendations.sort((a, b) => b.simulatedLoadRate - a.simulatedLoadRate);
+    return recommendations;
+}
+
+function runCapacitySimulation() {
+    const multiplier = parseFloat(document.getElementById('capacityMultiplier').value);
+    const planId = document.getElementById('capacityPlanSelect').value;
+    let planOverrides = {};
+    let planName = null;
+
+    if (planId) {
+        const plan = capacityExpansionPlans.find(p => p.id == planId);
+        if (plan) {
+            planName = plan.name;
+            plan.upgrades.forEach(u => {
+                planOverrides[u.linkId] = u.newBandwidth;
+            });
+        }
+    }
+
+    const linkLoadMap = calculateSimulatedLinkLoads(multiplier, planOverrides);
+    const currentSlaViolations = getCurrentSlaViolationCount();
+    const simSlaResult = calculateSimulatedSlaViolations(multiplier, planOverrides);
+    const bottleneck = findBottleneckLink(linkLoadMap);
+    const recommendations = calculateRecommendedBandwidths(linkLoadMap);
+
+    let overloadCount = 0;
+    let warningCount = 0;
+    const linkResults = [];
+    linkLoadMap.forEach(info => {
+        if (info.loadRate > 1.0) overloadCount++;
+        else if (info.loadRate > 0.8) warningCount++;
+        linkResults.push(info);
+    });
+    linkResults.sort((a, b) => b.loadRate - a.loadRate);
+
+    lastCapacitySimResult = {
+        multiplier,
+        planName,
+        planOverrides,
+        overloadCount,
+        warningCount,
+        linkResults,
+        currentSlaViolations,
+        simulatedSlaViolations: simSlaResult.violationCount,
+        violatingContracts: simSlaResult.violatingContracts,
+        bottleneck,
+        recommendations
+    };
+
+    renderCapacitySimResults(lastCapacitySimResult);
+    saveCapacitySimulationToBackend(lastCapacitySimResult);
+}
+
+function renderCapacitySimResults(result) {
+    document.getElementById('capacitySimResults').style.display = 'block';
+
+    const summaryEl = document.getElementById('capacitySimSummary');
+    const overloadClass = result.overloadCount > 0 ? 'danger' : 'safe';
+    const warningClass = result.warningCount > 0 ? 'warning' : 'safe';
+    const slaClass = result.simulatedSlaViolations > result.currentSlaViolations ? 'danger' : 'safe';
+
+    summaryEl.innerHTML = `
+        <div class="capacity-summary-item">
+            <span class="capacity-summary-value ${overloadClass}">${result.overloadCount}</span>
+            <span class="capacity-summary-label">超载链路</span>
+        </div>
+        <div class="capacity-summary-item">
+            <span class="capacity-summary-value ${warningClass}">${result.warningCount}</span>
+            <span class="capacity-summary-label">预警链路(>80%)</span>
+        </div>
+        <div class="capacity-summary-item">
+            <span class="capacity-summary-value ${slaClass}">${result.simulatedSlaViolations}</span>
+            <span class="capacity-summary-label">SLA违约(模拟)</span>
+        </div>
+        <div class="capacity-summary-item">
+            <span class="capacity-summary-value info">${result.multiplier.toFixed(1)}x</span>
+            <span class="capacity-summary-label">增长倍数</span>
+        </div>
+    `;
+
+    const linkListEl = document.getElementById('capacityLinkList');
+    let linkHtml = '';
+    result.linkResults.forEach(info => {
+        let itemClass = '';
+        let barColor = '#52c41a';
+        if (info.loadRate > 1.0) {
+            itemClass = 'overloaded';
+            barColor = '#ff4d4f';
+        } else if (info.loadRate > 0.8) {
+            itemClass = 'warning';
+            barColor = '#faad14';
+        }
+        const barWidth = Math.min(info.loadRate * 100, 100);
+        const pctDisplay = (info.loadRate * 100).toFixed(1) + '%';
+        const bwDisplay = info.effectiveBandwidth + 'Mbps';
+        const upgradeMark = info.effectiveBandwidth > info.currentBandwidth ? ' ⬆' : '';
+
+        linkHtml += `
+            <div class="capacity-link-item ${itemClass}">
+                <span class="capacity-link-name">${escapeHtml(info.linkName)}</span>
+                <span class="capacity-link-bar-container">
+                    <span class="capacity-link-bar-fill" style="width:${barWidth}%;background:${barColor};"></span>
+                </span>
+                <span class="capacity-link-pct" style="color:${barColor};">${pctDisplay}</span>
+                <span class="capacity-link-bw">${bwDisplay}${upgradeMark}</span>
+            </div>
+        `;
+    });
+    linkListEl.innerHTML = linkHtml || '<p style="font-size:12px;color:#999;text-align:center;padding:10px;">无活跃链路</p>';
+
+    const slaCompareEl = document.getElementById('capacitySlaCompare');
+    const currentVioClass = result.currentSlaViolations > 0 ? 'color:#fa8c16;' : 'color:#52c41a;';
+    const simVioClass = result.simulatedSlaViolations > 0 ? 'color:#ff4d4f;' : 'color:#52c41a;';
+    slaCompareEl.innerHTML = `
+        <div class="capacity-sla-compare">
+            <div class="capacity-sla-item current">
+                <div class="capacity-sla-label">当前实际违约</div>
+                <div class="capacity-sla-value" style="${currentVioClass}">${result.currentSlaViolations}</div>
+            </div>
+            <div class="capacity-sla-item simulated">
+                <div class="capacity-sla-label">模拟后违约</div>
+                <div class="capacity-sla-value" style="${simVioClass}">${result.simulatedSlaViolations}</div>
+            </div>
+        </div>
+    `;
+
+    const bottleneckSection = document.getElementById('capacityBottleneckSection');
+    const bottleneckEl = document.getElementById('capacityBottleneck');
+    if (result.bottleneck) {
+        bottleneckSection.style.display = 'block';
+        bottleneckEl.innerHTML = `
+            <div class="capacity-bottleneck-box">
+                <div class="capacity-bottleneck-title">瓶颈链路: ${escapeHtml(result.bottleneck.linkName)}</div>
+                <div class="capacity-bottleneck-desc">
+                    负载率 ${(result.bottleneck.loadRate * 100).toFixed(1)}%，当前带宽 ${result.bottleneck.currentBandwidth}Mbps。
+                    升级此链路可使最多超载链路降至安全水位。
+                </div>
+            </div>
+        `;
+    } else {
+        bottleneckSection.style.display = 'none';
+    }
+
+    const recommendedSection = document.getElementById('capacityRecommendedSection');
+    const recommendedEl = document.getElementById('capacityRecommended');
+    if (result.recommendations.length > 0) {
+        recommendedSection.style.display = 'block';
+        let tableHtml = `
+            <table class="capacity-recommended-table">
+                <tr><th>链路</th><th>当前带宽</th><th>模拟负载</th><th>建议带宽</th><th>带宽增量</th></tr>
+        `;
+        result.recommendations.forEach(rec => {
+            const increment = (rec.recommendedBandwidth - rec.currentBandwidth).toFixed(1);
+            tableHtml += `
+                <tr>
+                    <td>${escapeHtml(rec.linkName)}</td>
+                    <td>${rec.currentBandwidth}Mbps</td>
+                    <td style="color:#ff4d4f;">${(rec.simulatedLoadRate * 100).toFixed(1)}%</td>
+                    <td style="color:#1890ff;font-weight:500;">${rec.recommendedBandwidth}Mbps</td>
+                    <td>+${increment}Mbps</td>
+                </tr>
+            `;
+        });
+        tableHtml += '</table>';
+        recommendedEl.innerHTML = tableHtml;
+    } else {
+        recommendedSection.style.display = 'none';
+    }
+}
+
+function refreshCapacityPlanLinkList() {
+    const container = document.getElementById('capacityPlanLinkList');
+    if (links.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无链路</p>';
+        return;
+    }
+
+    const activeLinks = links.filter(l => l.enabled);
+    if (activeLinks.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无活跃链路</p>';
+        return;
+    }
+
+    let html = '';
+    activeLinks.forEach(link => {
+        const load = getLinkLoad(link.id);
+        const loadPct = (load * 100).toFixed(1);
+        html += `
+            <div class="capacity-plan-link-item" data-link-id="${link.id}">
+                <span class="capacity-plan-link-name">${escapeHtml(getLinkDisplayName(link.id))}</span>
+                <span class="capacity-plan-link-current">当前: ${link.bandwidth}Mbps (${loadPct}%)</span>
+                <input type="number" class="capacity-plan-link-input" data-link-id="${link.id}"
+                    min="${link.bandwidth + 0.1}" step="0.1" placeholder="目标带宽">
+                <span style="font-size:10px;color:#999;">Mbps</span>
+            </div>
+        `;
+    });
+    container.innerHTML = html;
+}
+
+function saveCapacityPlan() {
+    if (capacityExpansionPlans.length >= 5) {
+        alert('最多保存5个扩容方案');
+        return;
+    }
+
+    const name = document.getElementById('capacityPlanName').value.trim();
+    if (!name) {
+        alert('请输入方案名称');
+        return;
+    }
+
+    const upgrades = [];
+    const inputs = document.querySelectorAll('#capacityPlanLinkList .capacity-plan-link-input');
+    inputs.forEach(input => {
+        const linkId = parseInt(input.dataset.linkId);
+        const newBw = parseFloat(input.value);
+        const link = links.find(l => l.id === linkId);
+        if (link && !isNaN(newBw) && newBw > link.bandwidth) {
+            upgrades.push({
+                linkId: linkId,
+                linkName: getLinkDisplayName(linkId),
+                currentBandwidth: link.bandwidth,
+                newBandwidth: newBw
+            });
+        }
+    });
+
+    if (upgrades.length === 0) {
+        alert('请至少为一条链路设置大于当前带宽的目标带宽');
+        return;
+    }
+
+    const plan = {
+        id: capacityPlanIdCounter++,
+        name: name,
+        upgrades: upgrades,
+        totalInvestment: upgrades.reduce((sum, u) => sum + (u.newBandwidth - u.currentBandwidth), 0),
+        createdAt: Date.now()
+    };
+
+    capacityExpansionPlans.push(plan);
+    document.getElementById('capacityPlanName').value = '';
+    document.querySelectorAll('#capacityPlanLinkList .capacity-plan-link-input').forEach(input => {
+        input.value = '';
+    });
+
+    saveCapacityExpansionPlansToStorage();
+    refreshCapacityPlanSavedList();
+    refreshCapacityPlanSelects();
+    addLog(`扩容方案已保存: ${name}`, 'success');
+}
+
+function deleteCapacityPlan(planId) {
+    capacityExpansionPlans = capacityExpansionPlans.filter(p => p.id !== planId);
+    saveCapacityExpansionPlansToStorage();
+    refreshCapacityPlanSavedList();
+    refreshCapacityPlanSelects();
+}
+
+function loadCapacityPlanToSimulate(planId) {
+    const plan = capacityExpansionPlans.find(p => p.id === planId);
+    if (!plan) return;
+    document.getElementById('capacityPlanSelect').value = planId;
+    switchCapacityTab('simulate');
+}
+
+function refreshCapacityPlanSavedList() {
+    const container = document.getElementById('capacityPlanSavedList');
+    const countEl = document.getElementById('capacityPlanCount');
+    countEl.textContent = capacityExpansionPlans.length;
+
+    if (capacityExpansionPlans.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无方案</p>';
+        return;
+    }
+
+    let html = '';
+    capacityExpansionPlans.forEach(plan => {
+        const upgradeDesc = plan.upgrades.map(u =>
+            `${u.linkName}: ${u.currentBandwidth}→${u.newBandwidth}Mbps`
+        ).join('; ');
+        html += `
+            <div class="capacity-plan-saved-item">
+                <div class="capacity-plan-saved-header">
+                    <span class="capacity-plan-saved-name">${escapeHtml(plan.name)}</span>
+                    <div class="capacity-plan-saved-actions">
+                        <button class="btn btn-small" onclick="loadCapacityPlanToSimulate(${plan.id})">应用</button>
+                        <button class="btn btn-small" style="color:#ff4d4f;" onclick="deleteCapacityPlan(${plan.id})">删除</button>
+                    </div>
+                </div>
+                <div class="capacity-plan-saved-meta">
+                    升级${plan.upgrades.length}条链路 | 总投资: ${plan.totalInvestment.toFixed(1)}Mbps增量 | ${upgradeDesc}
+                </div>
+            </div>
+        `;
+    });
+    container.innerHTML = html;
+}
+
+function refreshCapacityPlanSelects() {
+    const selects = ['capacityPlanSelect', 'capacityComparePlan1', 'capacityComparePlan2'];
+    selects.forEach(selectId => {
+        const select = document.getElementById(selectId);
+        if (!select) return;
+        const currentValue = select.value;
+        const isSimSelect = selectId === 'capacityPlanSelect';
+        select.innerHTML = isSimSelect
+            ? '<option value="">无（仅增长模拟）</option>'
+            : '<option value="">选择方案</option>';
+        capacityExpansionPlans.forEach(plan => {
+            const option = document.createElement('option');
+            option.value = plan.id;
+            option.textContent = plan.name;
+            select.appendChild(option);
+        });
+        if (currentValue && capacityExpansionPlans.find(p => p.id == currentValue)) {
+            select.value = currentValue;
+        }
+    });
+}
+
+function runCapacityCompare() {
+    const plan1Id = document.getElementById('capacityComparePlan1').value;
+    const plan2Id = document.getElementById('capacityComparePlan2').value;
+    const multiplier = parseFloat(document.getElementById('capacityCompareMultiplier').value);
+
+    if (!plan1Id || !plan2Id) {
+        alert('请选择两个方案进行对比');
+        return;
+    }
+    if (plan1Id === plan2Id) {
+        alert('请选择不同的方案');
+        return;
+    }
+    if (isNaN(multiplier) || multiplier < 0.5 || multiplier > 10) {
+        alert('增长倍数范围为0.5-10');
+        return;
+    }
+
+    const plan1 = capacityExpansionPlans.find(p => p.id == plan1Id);
+    const plan2 = capacityExpansionPlans.find(p => p.id == plan2Id);
+    if (!plan1 || !plan2) {
+        alert('方案不存在');
+        return;
+    }
+
+    let overrides1 = {};
+    plan1.upgrades.forEach(u => { overrides1[u.linkId] = u.newBandwidth; });
+    let overrides2 = {};
+    plan2.upgrades.forEach(u => { overrides2[u.linkId] = u.newBandwidth; });
+
+    const loads1 = calculateSimulatedLinkLoads(multiplier, overrides1);
+    const loads2 = calculateSimulatedLinkLoads(multiplier, overrides2);
+    const sla1 = calculateSimulatedSlaViolations(multiplier, overrides1);
+    const sla2 = calculateSimulatedSlaViolations(multiplier, overrides2);
+
+    let overload1 = 0, overload2 = 0;
+    loads1.forEach(info => { if (info.loadRate > 1.0) overload1++; });
+    loads2.forEach(info => { if (info.loadRate > 1.0) overload2++; });
+
+    const investment1 = plan1.upgrades.reduce((s, u) => s + (u.newBandwidth - u.currentBandwidth), 0);
+    const investment2 = plan2.upgrades.reduce((s, u) => s + (u.newBandwidth - u.currentBandwidth), 0);
+
+    const container = document.getElementById('capacityCompareResults');
+    container.style.display = 'block';
+
+    const o1Class = overload1 === 0 ? 'good' : 'bad';
+    const o2Class = overload2 === 0 ? 'good' : 'bad';
+    const s1Class = sla1.violationCount === 0 ? 'good' : 'bad';
+    const s2Class = sla2.violationCount === 0 ? 'good' : 'bad';
+
+    container.innerHTML = `
+        <table>
+            <tr>
+                <th>指标</th>
+                <th>方案A: ${escapeHtml(plan1.name)}</th>
+                <th>方案B: ${escapeHtml(plan2.name)}</th>
+            </tr>
+            <tr>
+                <td>超载链路数</td>
+                <td class="${o1Class}">${overload1}</td>
+                <td class="${o2Class}">${overload2}</td>
+            </tr>
+            <tr>
+                <td>SLA违约数</td>
+                <td class="${s1Class}">${sla1.violationCount}</td>
+                <td class="${s2Class}">${sla2.violationCount}</td>
+            </tr>
+            <tr>
+                <td>总投资(Mbps增量)</td>
+                <td>${investment1.toFixed(1)}</td>
+                <td>${investment2.toFixed(1)}</td>
+            </tr>
+            <tr>
+                <td>升级链路数</td>
+                <td>${plan1.upgrades.length}</td>
+                <td>${plan2.upgrades.length}</td>
+            </tr>
+            <tr>
+                <td>性价比(违约数/投资)</td>
+                <td>${investment1 > 0 ? (sla1.violationCount / investment1).toFixed(3) : 'N/A'}</td>
+                <td>${investment2 > 0 ? (sla2.violationCount / investment2).toFixed(3) : 'N/A'}</td>
+            </tr>
+        </table>
+    `;
+}
+
+async function saveCapacitySimulationToBackend(result) {
+    try {
+        const overloadedLinks = result.linkResults
+            .filter(l => l.loadRate > 1.0)
+            .map(l => ({ linkId: l.linkId, name: l.linkName, loadRate: (l.loadRate * 100).toFixed(1) + '%' }));
+
+        const warningLinks = result.linkResults
+            .filter(l => l.loadRate > 0.8 && l.loadRate <= 1.0)
+            .map(l => ({ linkId: l.linkId, name: l.linkName, loadRate: (l.loadRate * 100).toFixed(1) + '%' }));
+
+        const recommendedBandwidths = result.recommendations.map(r => ({
+            linkId: r.linkId,
+            name: r.linkName,
+            currentBandwidth: r.currentBandwidth,
+            recommendedBandwidth: r.recommendedBandwidth
+        }));
+
+        await apiRequest('/api/capacity-simulations', {
+            method: 'POST',
+            body: JSON.stringify({
+                growthMultiplier: result.multiplier,
+                overloadedLinks: overloadedLinks,
+                warningLinks: warningLinks,
+                slaViolationsCurrent: result.currentSlaViolations,
+                slaViolationsSimulated: result.simulatedSlaViolations,
+                expansionPlanName: result.planName || null,
+                expansionPlanData: result.planName ? result.planOverrides : null,
+                bottleneckLinkId: result.bottleneck ? result.bottleneck.linkId : null,
+                bottleneckLinkName: result.bottleneck ? result.bottleneck.linkName : null,
+                recommendedBandwidths: recommendedBandwidths,
+                topologySnapshot: {
+                    linkCount: links.length,
+                    flowCount: trafficFlows.length,
+                    deviceCount: devices.length
+                },
+                timestamp: Date.now()
+            })
+        });
+    } catch (err) {
+        console.error('保存模拟结果失败:', err);
+    }
+}
+
+async function loadCapacityHistory() {
+    const container = document.getElementById('capacityHistoryList');
+    container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">加载中...</p>';
+
+    try {
+        const resp = await apiRequest('/api/capacity-simulations?limit=20');
+        if (!resp || !resp.success || !resp.data || resp.data.length === 0) {
+            container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">暂无历史记录</p>';
+            return;
+        }
+
+        let html = '';
+        resp.data.forEach(record => {
+            const time = new Date(record.timestamp).toLocaleString('zh-CN');
+            let overloaded = [];
+            try { overloaded = typeof record.overloadedLinks === 'string' ? JSON.parse(record.overloadedLinks) : (record.overloadedLinks || []); } catch (e) {}
+
+            const growthMult = record.growthMultiplier !== undefined ? record.growthMultiplier.toFixed(1) : '?';
+            const slaCurrent = record.slaViolationsCurrent !== undefined ? record.slaViolationsCurrent : '?';
+            const slaSimulated = record.slaViolationsSimulated !== undefined ? record.slaViolationsSimulated : '?';
+            const planName = record.expansionPlanName || '';
+
+            html += `
+                <div class="capacity-history-item">
+                    <div class="capacity-history-header">
+                        <span class="capacity-history-multiplier">${growthMult}x 增长</span>
+                        <span class="capacity-history-time">${time}</span>
+                    </div>
+                    <div class="capacity-history-meta">
+                        <span class="capacity-history-tag overload">超载${overloaded.length}条</span>
+                        <span class="capacity-history-tag sla">SLA ${slaCurrent}→${slaSimulated}</span>
+                        ${planName ? `<span class="capacity-history-tag plan">${escapeHtml(planName)}</span>` : ''}
+                    </div>
+                </div>
+            `;
+        });
+        container.innerHTML = html;
+    } catch (err) {
+        console.error('加载历史记录失败:', err);
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">加载失败</p>';
+    }
+}
+
+function saveCapacityExpansionPlansToStorage() {
+    try {
+        localStorage.setItem('capacityExpansionPlans', JSON.stringify(capacityExpansionPlans));
+        localStorage.setItem('capacityPlanIdCounter', capacityPlanIdCounter.toString());
+    } catch (e) {
+        console.error('保存扩容方案失败:', e);
+    }
+}
+
+function loadCapacityExpansionPlansFromStorage() {
+    try {
+        const saved = localStorage.getItem('capacityExpansionPlans');
+        const savedCounter = localStorage.getItem('capacityPlanIdCounter');
+        if (saved) {
+            capacityExpansionPlans = JSON.parse(saved);
+        }
+        if (savedCounter) {
+            capacityPlanIdCounter = parseInt(savedCounter);
+        }
+    } catch (e) {
+        console.error('加载扩容方案失败:', e);
+    }
+}
+
+initCapacityPlanningModule();
