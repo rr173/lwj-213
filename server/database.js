@@ -143,6 +143,82 @@ function initDatabase() {
       db.run(`
         CREATE INDEX IF NOT EXISTS idx_sla_events_contract_name 
         ON sla_events(contract_name)
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS migration_tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'draft',
+          description TEXT,
+          total_batches INTEGER NOT NULL DEFAULT 0,
+          completed_batches INTEGER NOT NULL DEFAULT 0,
+          total_flows INTEGER NOT NULL DEFAULT 0,
+          preview_result TEXT,
+          final_result TEXT,
+          pre_migration_snapshot TEXT,
+          post_migration_snapshot TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          started_at INTEGER,
+          finished_at INTEGER
+        )
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS migration_batches (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id INTEGER NOT NULL,
+          batch_number INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          flow_count INTEGER NOT NULL DEFAULT 0,
+          preview_result TEXT,
+          execution_result TEXT,
+          scheduled_at INTEGER,
+          started_at INTEGER,
+          completed_at INTEGER,
+          FOREIGN KEY (task_id) REFERENCES migration_tasks(id) ON DELETE CASCADE
+        )
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS migration_flows (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id INTEGER NOT NULL,
+          batch_id INTEGER,
+          flow_id INTEGER NOT NULL,
+          src_id INTEGER NOT NULL,
+          dst_id INTEGER NOT NULL,
+          src_name TEXT,
+          dst_name TEXT,
+          rate REAL NOT NULL,
+          priority TEXT NOT NULL DEFAULT 'normal',
+          target_type TEXT NOT NULL DEFAULT 'path',
+          target_path TEXT,
+          target_next_hop INTEGER,
+          target_next_hop_name TEXT,
+          original_path TEXT,
+          original_next_hop INTEGER,
+          status TEXT NOT NULL DEFAULT 'pending',
+          sla_contract_name TEXT,
+          FOREIGN KEY (task_id) REFERENCES migration_tasks(id) ON DELETE CASCADE,
+          FOREIGN KEY (batch_id) REFERENCES migration_batches(id) ON DELETE SET NULL
+        )
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_migration_tasks_created 
+        ON migration_tasks(created_at DESC)
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_migration_batches_task_id 
+        ON migration_batches(task_id)
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_migration_flows_task_id 
+        ON migration_flows(task_id)
       `, (err) => {
         if (err) reject(err);
         else resolve();
@@ -936,6 +1012,455 @@ async function compareTrafficRecordings(recordingId1, recordingId2) {
   };
 }
 
+const MAX_MIGRATION_TASKS = 30;
+
+function saveMigrationTask(taskData) {
+  return new Promise((resolve, reject) => {
+    const { name, description, batches, flows, previewResult, preMigrationSnapshot } = taskData;
+    const now = Date.now();
+
+    db.get('SELECT COUNT(*) as count FROM migration_tasks', (err, countRow) => {
+      if (err) return reject(err);
+
+      const currentCount = countRow.count;
+
+      const deleteOldIfNeeded = () => {
+        return new Promise((res, rej) => {
+          if (currentCount >= MAX_MIGRATION_TASKS) {
+            const toDelete = currentCount - MAX_MIGRATION_TASKS + 1;
+            db.run(`
+              DELETE FROM migration_tasks 
+              WHERE id IN (
+                SELECT id FROM migration_tasks 
+                ORDER BY created_at ASC 
+                LIMIT ?
+              )
+            `, [toDelete], (err) => {
+              if (err) rej(err);
+              else res();
+            });
+          } else {
+            res();
+          }
+        });
+      };
+
+      deleteOldIfNeeded()
+        .then(() => {
+          const stmt = db.prepare(`
+            INSERT INTO migration_tasks (
+              name, status, description, total_batches, total_flows,
+              preview_result, pre_migration_snapshot, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `);
+
+          stmt.run(
+            name,
+            'draft',
+            description || null,
+            batches ? batches.length : 0,
+            flows ? flows.length : 0,
+            previewResult ? JSON.stringify(previewResult) : null,
+            preMigrationSnapshot ? JSON.stringify(preMigrationSnapshot) : null,
+            now,
+            now,
+            function(err) {
+              if (err) return reject(err);
+              const taskId = this.lastID;
+
+              const saveBatchesAndFlows = async () => {
+                if (batches && batches.length > 0) {
+                  for (let i = 0; i < batches.length; i++) {
+                    const batch = batches[i];
+                    const batchId = await saveBatchInternal(taskId, batch, i + 1);
+                    if (batch.flows && batch.flows.length > 0) {
+                      for (const flow of batch.flows) {
+                        await saveFlowInternal(taskId, batchId, flow);
+                      }
+                    }
+                  }
+                } else if (flows && flows.length > 0) {
+                  for (const flow of flows) {
+                    await saveFlowInternal(taskId, null, flow);
+                  }
+                }
+              };
+
+              saveBatchesAndFlows()
+                .then(() => {
+                  resolve({
+                    id: taskId,
+                    name,
+                    status: 'draft',
+                    createdAt: now
+                  });
+                })
+                .catch(reject);
+            }
+          );
+        })
+        .catch(reject);
+    });
+  });
+}
+
+function saveBatchInternal(taskId, batch, batchNumber) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`
+      INSERT INTO migration_batches (
+        task_id, batch_number, status, flow_count, preview_result, scheduled_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      taskId,
+      batchNumber,
+      batch.status || 'pending',
+      batch.flows ? batch.flows.length : 0,
+      batch.previewResult ? JSON.stringify(batch.previewResult) : null,
+      batch.scheduledAt || null,
+      function(err) {
+        if (err) return reject(err);
+        resolve(this.lastID);
+      }
+    );
+  });
+}
+
+function saveFlowInternal(taskId, batchId, flow) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`
+      INSERT INTO migration_flows (
+        task_id, batch_id, flow_id, src_id, dst_id, src_name, dst_name,
+        rate, priority, target_type, target_path, target_next_hop,
+        target_next_hop_name, original_path, original_next_hop,
+        status, sla_contract_name
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      taskId,
+      batchId || null,
+      flow.flowId || flow.id || 0,
+      flow.srcId || flow.src_id || 0,
+      flow.dstId || flow.dst_id || 0,
+      flow.srcName || flow.src_name || null,
+      flow.dstName || flow.dst_name || null,
+      flow.rate || 0,
+      flow.priority || 'normal',
+      flow.targetType || flow.target_type || 'path',
+      flow.targetPath ? JSON.stringify(flow.targetPath) : (flow.target_path ? flow.target_path : null),
+      flow.targetNextHop || flow.target_next_hop || null,
+      flow.targetNextHopName || flow.target_next_hop_name || null,
+      flow.originalPath ? JSON.stringify(flow.originalPath) : (flow.original_path ? flow.original_path : null),
+      flow.originalNextHop || flow.original_next_hop || null,
+      flow.status || 'pending',
+      flow.slaContractName || flow.sla_contract_name || null,
+      function(err) {
+        if (err) return reject(err);
+        resolve(this.lastID);
+      }
+    );
+  });
+}
+
+function listMigrationTasks() {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT id, name, status, description, total_batches, completed_batches, 
+             total_flows, created_at, updated_at, started_at, finished_at
+      FROM migration_tasks 
+      ORDER BY created_at DESC
+      LIMIT ?
+    `, [MAX_MIGRATION_TASKS], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        status: row.status,
+        description: row.description,
+        totalBatches: row.total_batches,
+        completedBatches: row.completed_batches,
+        totalFlows: row.total_flows,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        startedAt: row.started_at,
+        finishedAt: row.finished_at
+      })));
+    });
+  });
+}
+
+function getMigrationTask(taskId) {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT * FROM migration_tasks WHERE id = ?`, [taskId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+
+      const task = {
+        id: row.id,
+        name: row.name,
+        status: row.status,
+        description: row.description,
+        totalBatches: row.total_batches,
+        completedBatches: row.completed_batches,
+        totalFlows: row.total_flows,
+        previewResult: row.preview_result ? JSON.parse(row.preview_result) : null,
+        finalResult: row.final_result ? JSON.parse(row.final_result) : null,
+        preMigrationSnapshot: row.pre_migration_snapshot ? JSON.parse(row.pre_migration_snapshot) : null,
+        postMigrationSnapshot: row.post_migration_snapshot ? JSON.parse(row.post_migration_snapshot) : null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        startedAt: row.started_at,
+        finishedAt: row.finished_at
+      };
+
+      db.all(`SELECT * FROM migration_batches WHERE task_id = ? ORDER BY batch_number`, [taskId], (err, batchRows) => {
+        if (err) return reject(err);
+
+        task.batches = batchRows.map(bRow => ({
+          id: bRow.id,
+          batchNumber: bRow.batch_number,
+          status: bRow.status,
+          flowCount: bRow.flow_count,
+          previewResult: bRow.preview_result ? JSON.parse(bRow.preview_result) : null,
+          executionResult: bRow.execution_result ? JSON.parse(bRow.execution_result) : null,
+          scheduledAt: bRow.scheduled_at,
+          startedAt: bRow.started_at,
+          completedAt: bRow.completed_at
+        }));
+
+        db.all(`SELECT * FROM migration_flows WHERE task_id = ? ORDER BY id`, [taskId], (err, flowRows) => {
+          if (err) return reject(err);
+
+          task.flows = flowRows.map(fRow => ({
+            id: fRow.id,
+            batchId: fRow.batch_id,
+            flowId: fRow.flow_id,
+            srcId: fRow.src_id,
+            dstId: fRow.dst_id,
+            srcName: fRow.src_name,
+            dstName: fRow.dst_name,
+            rate: fRow.rate,
+            priority: fRow.priority,
+            targetType: fRow.target_type,
+            targetPath: fRow.target_path ? JSON.parse(fRow.target_path) : null,
+            targetNextHop: fRow.target_next_hop,
+            targetNextHopName: fRow.target_next_hop_name,
+            originalPath: fRow.original_path ? JSON.parse(fRow.original_path) : null,
+            originalNextHop: fRow.original_next_hop,
+            status: fRow.status,
+            slaContractName: fRow.sla_contract_name
+          }));
+
+          resolve(task);
+        });
+      });
+    });
+  });
+}
+
+function updateMigrationTask(taskId, updates) {
+  return new Promise((resolve, reject) => {
+    const setClauses = [];
+    const params = [];
+
+    if (updates.name !== undefined) {
+      setClauses.push('name = ?');
+      params.push(updates.name);
+    }
+    if (updates.status !== undefined) {
+      setClauses.push('status = ?');
+      params.push(updates.status);
+    }
+    if (updates.description !== undefined) {
+      setClauses.push('description = ?');
+      params.push(updates.description);
+    }
+    if (updates.completedBatches !== undefined) {
+      setClauses.push('completed_batches = ?');
+      params.push(updates.completedBatches);
+    }
+    if (updates.previewResult !== undefined) {
+      setClauses.push('preview_result = ?');
+      params.push(JSON.stringify(updates.previewResult));
+    }
+    if (updates.finalResult !== undefined) {
+      setClauses.push('final_result = ?');
+      params.push(JSON.stringify(updates.finalResult));
+    }
+    if (updates.preMigrationSnapshot !== undefined) {
+      setClauses.push('pre_migration_snapshot = ?');
+      params.push(JSON.stringify(updates.preMigrationSnapshot));
+    }
+    if (updates.postMigrationSnapshot !== undefined) {
+      setClauses.push('post_migration_snapshot = ?');
+      params.push(JSON.stringify(updates.postMigrationSnapshot));
+    }
+    if (updates.startedAt !== undefined) {
+      setClauses.push('started_at = ?');
+      params.push(updates.startedAt);
+    }
+    if (updates.finishedAt !== undefined) {
+      setClauses.push('finished_at = ?');
+      params.push(updates.finishedAt);
+    }
+
+    if (setClauses.length === 0) {
+      return resolve(null);
+    }
+
+    setClauses.push('updated_at = ?');
+    params.push(Date.now());
+    params.push(taskId);
+
+    const sql = `UPDATE migration_tasks SET ${setClauses.join(', ')} WHERE id = ?`;
+    db.run(sql, params, function(err) {
+      if (err) return reject(err);
+      resolve({ changed: this.changes > 0 });
+    });
+  });
+}
+
+function updateMigrationBatch(batchId, updates) {
+  return new Promise((resolve, reject) => {
+    const setClauses = [];
+    const params = [];
+
+    if (updates.status !== undefined) {
+      setClauses.push('status = ?');
+      params.push(updates.status);
+    }
+    if (updates.executionResult !== undefined) {
+      setClauses.push('execution_result = ?');
+      params.push(JSON.stringify(updates.executionResult));
+    }
+    if (updates.previewResult !== undefined) {
+      setClauses.push('preview_result = ?');
+      params.push(JSON.stringify(updates.previewResult));
+    }
+    if (updates.startedAt !== undefined) {
+      setClauses.push('started_at = ?');
+      params.push(updates.startedAt);
+    }
+    if (updates.completedAt !== undefined) {
+      setClauses.push('completed_at = ?');
+      params.push(updates.completedAt);
+    }
+
+    if (setClauses.length === 0) {
+      return resolve(null);
+    }
+
+    params.push(batchId);
+    const sql = `UPDATE migration_batches SET ${setClauses.join(', ')} WHERE id = ?`;
+    db.run(sql, params, function(err) {
+      if (err) return reject(err);
+      resolve({ changed: this.changes > 0 });
+    });
+  });
+}
+
+function updateMigrationFlow(flowId, updates) {
+  return new Promise((resolve, reject) => {
+    const setClauses = [];
+    const params = [];
+
+    if (updates.status !== undefined) {
+      setClauses.push('status = ?');
+      params.push(updates.status);
+    }
+    if (updates.batchId !== undefined) {
+      setClauses.push('batch_id = ?');
+      params.push(updates.batchId);
+    }
+
+    if (setClauses.length === 0) {
+      return resolve(null);
+    }
+
+    params.push(flowId);
+    const sql = `UPDATE migration_flows SET ${setClauses.join(', ')} WHERE id = ?`;
+    db.run(sql, params, function(err) {
+      if (err) return reject(err);
+      resolve({ changed: this.changes > 0 });
+    });
+  });
+}
+
+function deleteMigrationTask(taskId) {
+  return new Promise((resolve, reject) => {
+    db.run('DELETE FROM migration_tasks WHERE id = ?', [taskId], function(err) {
+      if (err) return reject(err);
+      resolve({ deleted: this.changes });
+    });
+  });
+}
+
+function duplicateMigrationTask(taskId, newName) {
+  return new Promise((resolve, reject) => {
+    getMigrationTask(taskId).then(original => {
+      if (!original) return resolve(null);
+
+      const now = Date.now();
+      const stmt = db.prepare(`
+        INSERT INTO migration_tasks (
+          name, status, description, total_batches, completed_batches,
+          total_flows, preview_result, pre_migration_snapshot, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      stmt.run(
+        newName || original.name + ' (副本)',
+        'draft',
+        original.description,
+        original.totalBatches,
+        0,
+        original.totalFlows,
+        null,
+        null,
+        now,
+        now,
+        function(err) {
+          if (err) return reject(err);
+          const newTaskId = this.lastID;
+
+          const copyBatches = async () => {
+            const batchIdMap = new Map();
+            if (original.batches && original.batches.length > 0) {
+              for (const batch of original.batches) {
+                const newBatchId = await saveBatchInternal(newTaskId, {
+                  status: 'pending',
+                  previewResult: null
+                }, batch.batchNumber);
+                batchIdMap.set(batch.id, newBatchId);
+              }
+            }
+
+            if (original.flows && original.flows.length > 0) {
+              for (const flow of original.flows) {
+                const newBatchId = flow.batchId ? batchIdMap.get(flow.batchId) : null;
+                await saveFlowInternal(newTaskId, newBatchId, {
+                  ...flow,
+                  status: 'pending'
+                });
+              }
+            }
+          };
+
+          copyBatches()
+            .then(() => {
+              resolve({
+                id: newTaskId,
+                name: newName || original.name + ' (副本)',
+                createdAt: now
+              });
+            })
+            .catch(reject);
+        }
+      );
+    }).catch(reject);
+  });
+}
+
 function saveSlaEvent(eventData) {
   return new Promise((resolve, reject) => {
     const stmt = db.prepare(`
@@ -1017,5 +1542,13 @@ module.exports = {
   deleteTrafficRecording,
   compareTrafficRecordings,
   saveSlaEvent,
-  listSlaEvents
+  listSlaEvents,
+  saveMigrationTask,
+  listMigrationTasks,
+  getMigrationTask,
+  updateMigrationTask,
+  updateMigrationBatch,
+  updateMigrationFlow,
+  deleteMigrationTask,
+  duplicateMigrationTask
 };

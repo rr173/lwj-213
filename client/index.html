@@ -123,6 +123,20 @@
                 </div>
             </div>
 
+            <h3>业务流迁移编排</h3>
+            <div class="migration-panel">
+                <div class="migration-actions">
+                    <button id="openMigrationModalBtn" class="btn btn-primary" style="width:100%;">打开迁移编排</button>
+                </div>
+                <div class="form-group" style="margin-top:10px;">
+                    <label>历史任务 (最近30个)</label>
+                    <button id="refreshMigrationListBtn" class="btn btn-small" style="float:right;">刷新</button>
+                </div>
+                <div class="migration-task-list" id="migrationTaskList">
+                    <p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">加载中...</p>
+                </div>
+            </div>
+
             <h3>拓扑存档</h3>
             <div class="topology-archive-panel">
                 <div class="form-group">
@@ -527,6 +541,90 @@
             <div class="modal-buttons">
                 <button id="cancelLinkConfig" class="btn">取消</button>
                 <button id="confirmLinkConfig" class="btn btn-primary">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="migrationModal" class="modal migration-modal">
+        <div class="modal-content migration-modal-content">
+            <div class="migration-modal-header">
+                <h3>业务流迁移编排</h3>
+                <button id="closeMigrationModal" class="btn-small">×</button>
+            </div>
+
+            <div class="migration-tabs">
+                <button class="migration-tab active" data-migration-tab="create">新建任务</button>
+                <button class="migration-tab" data-migration-tab="history">历史任务</button>
+            </div>
+
+            <div class="migration-tab-content" id="migration-tab-create">
+                <div class="migration-form-section">
+                    <div class="form-group">
+                        <label>任务名称</label>
+                        <input type="text" id="migrationTaskName" placeholder="输入迁移任务名称">
+                    </div>
+                    <div class="form-group">
+                        <label>任务描述</label>
+                        <input type="text" id="migrationTaskDesc" placeholder="可选，简要描述迁移目的">
+                    </div>
+                </div>
+
+                <div class="migration-section">
+                    <div class="migration-section-header">
+                        <h4>选择业务流</h4>
+                        <span class="hint" id="migrationFlowCount">已选 0 条</span>
+                    </div>
+                    <div class="migration-flow-select" id="migrationFlowSelect">
+                        <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无活跃流量，请先注入流量</p>
+                    </div>
+                </div>
+
+                <div class="migration-section">
+                    <div class="migration-section-header">
+                        <h4>目标设置</h4>
+                    </div>
+                    <div class="migration-target-setting" id="migrationTargetSetting">
+                        <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">请先选择业务流</p>
+                    </div>
+                </div>
+
+                <div class="migration-section">
+                    <div class="migration-section-header">
+                        <h4>分批设置</h4>
+                        <button id="addBatchBtn" class="btn btn-small btn-primary">添加批次</button>
+                    </div>
+                    <div class="migration-batches" id="migrationBatches">
+                        <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">单批执行，所有流一起切换</p>
+                    </div>
+                </div>
+
+                <div class="migration-preview-section" id="migrationPreviewSection" style="display:none;">
+                    <div class="migration-section-header">
+                        <h4>预演结果</h4>
+                        <span class="migration-preview-status" id="migrationPreviewStatus"></span>
+                    </div>
+                    <div class="migration-preview-result" id="migrationPreviewResult"></div>
+                </div>
+
+                <div class="migration-actions-row">
+                    <button id="previewMigrationBtn" class="btn btn-primary">预演迁移</button>
+                    <button id="executeMigrationBtn" class="btn btn-success" style="display:none;">执行迁移</button>
+                    <button id="saveMigrationDraftBtn" class="btn">保存草稿</button>
+                </div>
+            </div>
+
+            <div class="migration-tab-content" id="migration-tab-history" style="display:none;">
+                <div class="migration-history-list" id="migrationHistoryList">
+                    <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:20px 0;">加载中...</p>
+                </div>
+            </div>
+
+            <div class="migration-detail-view" id="migrationDetailView" style="display:none;">
+                <div class="migration-detail-header">
+                    <button id="backFromDetailBtn" class="btn btn-small">← 返回</button>
+                    <h4 id="migrationDetailTitle">任务详情</h4>
+                </div>
+                <div class="migration-detail-content" id="migrationDetailContent"></div>
             </div>
         </div>
     </div>

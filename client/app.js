@@ -6208,4 +6208,1249 @@ drawLink = function(link) {
     originalDrawLinkSla(link);
 };
 
+let currentMigrationTask = null;
+let selectedMigrationFlows = [];
+let migrationBatches = [];
+let currentPreviewResult = null;
+let migrationHistory = [];
+let isMigrationExecuting = false;
+let currentExecutingBatch = null;
+let preMigrationSnapshot = null;
+
+function openMigrationModal() {
+    const modal = document.getElementById('migrationModal');
+    modal.style.display = 'block';
+    loadMigrationTaskList();
+    renderMigrationFlowSelect();
+    renderMigrationBatches();
+    switchMigrationTab('create');
+    resetMigrationForm();
+}
+
+function closeMigrationModal() {
+    document.getElementById('migrationModal').style.display = 'none';
+}
+
+function resetMigrationForm() {
+    document.getElementById('migrationTaskName').value = '';
+    document.getElementById('migrationTaskDesc').value = '';
+    selectedMigrationFlows = [];
+    migrationBatches = [];
+    currentPreviewResult = null;
+    document.getElementById('migrationPreviewSection').style.display = 'none';
+    document.getElementById('executeMigrationBtn').style.display = 'none';
+    document.getElementById('migrationDetailView').style.display = 'none';
+    document.querySelectorAll('.migration-tab-content').forEach(c => c.style.display = 'none');
+    document.getElementById('migration-tab-create').style.display = 'block';
+    renderMigrationFlowSelect();
+    renderMigrationTargetSetting();
+    renderMigrationBatches();
+    updateMigrationFlowCount();
+}
+
+function switchMigrationTab(tabName) {
+    document.querySelectorAll('.migration-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.migrationTab === tabName);
+    });
+
+    document.querySelectorAll('.migration-tab-content').forEach(content => {
+        content.style.display = 'none';
+    });
+
+    document.getElementById('migration-tab-' + tabName).style.display = 'block';
+    document.getElementById('migrationDetailView').style.display = 'none';
+
+    if (tabName === 'history') {
+        loadMigrationHistory();
+    }
+}
+
+function renderMigrationFlowSelect() {
+    const container = document.getElementById('migrationFlowSelect');
+
+    if (trafficFlows.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无活跃流量，请先注入流量</p>';
+        return;
+    }
+
+    let html = '<div class="migration-flow-list">';
+
+    trafficFlows.forEach(flow => {
+        const srcDev = devices.find(d => d.id === flow.srcId);
+        const dstDev = devices.find(d => d.id === flow.dstId);
+        const isSelected = selectedMigrationFlows.some(f => f.flowId === flow.id);
+
+        html += `
+            <div class="migration-flow-item ${isSelected ? 'selected' : ''}" 
+                 onclick="toggleMigrationFlow(${flow.id})">
+                <div class="migration-flow-checkbox">${isSelected ? '✓' : ''}</div>
+                <div class="migration-flow-info">
+                    <div class="migration-flow-title">
+                        <span class="flow-dot" style="background:${flow.color}"></span>
+                        ${srcDev?.name || flow.srcId} → ${dstDev?.name || flow.dstId}
+                    </div>
+                    <div class="migration-flow-subtitle">
+                        ${flow.rate} Mbps · ${flow.priority === 'priority' ? '优先' : '普通'}
+                    </div>
+                </div>
+            </div>
+        `;
+    });
+
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+function toggleMigrationFlow(flowId) {
+    const flow = trafficFlows.find(f => f.id === flowId);
+    if (!flow) return;
+
+    const index = selectedMigrationFlows.findIndex(f => f.flowId === flowId);
+
+    if (index >= 0) {
+        selectedMigrationFlows.splice(index, 1);
+    } else {
+        const currentPath = getFlowCurrentPath(flow);
+        const srcDev = devices.find(d => d.id === flow.srcId);
+        const dstDev = devices.find(d => d.id === flow.dstId);
+
+        selectedMigrationFlows.push({
+            flowId: flow.id,
+            srcId: flow.srcId,
+            dstId: flow.dstId,
+            srcName: srcDev?.name,
+            dstName: dstDev?.name,
+            rate: flow.rate,
+            priority: flow.priority,
+            targetType: 'path',
+            targetPath: currentPath,
+            targetNextHop: null,
+            targetNextHopName: null,
+            originalPath: currentPath,
+            originalNextHop: currentPath && currentPath.length > 1 ? currentPath[1] : null,
+            slaContractName: getFlowSlaContract(flow)
+        });
+    }
+
+    renderMigrationFlowSelect();
+    renderMigrationTargetSetting();
+    updateMigrationFlowCount();
+}
+
+function getFlowCurrentPath(flow) {
+    const result = dijkstra(flow.srcId);
+    const path = [];
+    let current = flow.dstId;
+
+    while (current !== null && current !== undefined) {
+        path.unshift(current);
+        current = result.prev[current];
+    }
+
+    if (path[0] === flow.srcId && path[path.length - 1] === flow.dstId) {
+        return path;
+    }
+
+    return [flow.srcId, flow.dstId];
+}
+
+function getFlowSlaContract(flow) {
+    const contract = slaContracts?.find(c =>
+        c.srcDeviceId === flow.srcId && c.dstDeviceId === flow.dstId
+    );
+    return contract?.name || null;
+}
+
+function updateMigrationFlowCount() {
+    document.getElementById('migrationFlowCount').textContent = `已选 ${selectedMigrationFlows.length} 条`;
+}
+
+function renderMigrationTargetSetting() {
+    const container = document.getElementById('migrationTargetSetting');
+
+    if (selectedMigrationFlows.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">请先选择业务流</p>';
+        return;
+    }
+
+    let html = '<div class="migration-target-list">';
+
+    selectedMigrationFlows.forEach((flowItem, index) => {
+        const targetNextHopOptions = getNextHopOptions(flowItem.srcId);
+
+        html += `
+            <div class="migration-target-item">
+                <div class="migration-target-header">
+                    <span class="migration-target-title">
+                        ${flowItem.srcName || flowItem.srcId} → ${flowItem.dstName || flowItem.dstId}
+                    </span>
+                    <span class="migration-target-rate">${flowItem.rate} Mbps</span>
+                </div>
+                <div class="migration-target-type">
+                    <label>
+                        <input type="radio" name="targetType_${index}" value="path"
+                               ${flowItem.targetType === 'path' ? 'checked' : ''}
+                               onchange="setFlowTargetType(${index}, 'path')">
+                        指定完整路径
+                    </label>
+                    <label>
+                        <input type="radio" name="targetType_${index}" value="nexthop"
+                               ${flowItem.targetType === 'nexthop' ? 'checked' : ''}
+                               onchange="setFlowTargetType(${index}, 'nexthop')">
+                        指定下一跳（出口）
+                    </label>
+                </div>
+                ${flowItem.targetType === 'path' ? `
+                    <div class="migration-target-path">
+                        <span class="hint">当前路径：${formatPath(flowItem.targetPath || flowItem.originalPath)}</span>
+                        <div class="migration-target-edit">
+                            <button class="btn btn-small" onclick="editFlowTargetPath(${index})">选择路径</button>
+                        </div>
+                    </div>
+                ` : `
+                    <div class="migration-target-nexthop">
+                        <select onchange="setFlowTargetNextHop(${index}, this.value)">
+                            <option value="">选择下一跳</option>
+                            ${targetNextHopOptions.map(opt => `
+                                <option value="${opt.id}" ${flowItem.targetNextHop === opt.id ? 'selected' : ''}>
+                                    ${opt.name}
+                                </option>
+                            `).join('')}
+                        </select>
+                    </div>
+                `}
+            </div>
+        `;
+    });
+
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+function getNextHopOptions(deviceId) {
+    const neighbors = getNeighbors(deviceId);
+    return neighbors.map(n => {
+        const dev = devices.find(d => d.id === n.nodeId);
+        return {
+            id: n.nodeId,
+            name: dev?.name || n.nodeId
+        };
+    });
+}
+
+function formatPath(path) {
+    if (!path || path.length === 0) return '-';
+    return path.map(id => {
+        const d = devices.find(dev => dev.id === id);
+        return d?.name || id;
+    }).join(' → ');
+}
+
+function setFlowTargetType(index, type) {
+    selectedMigrationFlows[index].targetType = type;
+    if (type === 'path') {
+        selectedMigrationFlows[index].targetNextHop = null;
+        selectedMigrationFlows[index].targetNextHopName = null;
+    } else {
+        selectedMigrationFlows[index].targetPath = null;
+    }
+    renderMigrationTargetSetting();
+}
+
+function setFlowTargetNextHop(index, nextHopId) {
+    const flowItem = selectedMigrationFlows[index];
+    flowItem.targetNextHop = parseInt(nextHopId) || null;
+    const dev = devices.find(d => d.id === flowItem.targetNextHop);
+    flowItem.targetNextHopName = dev?.name || null;
+
+    if (flowItem.targetNextHop) {
+        const path = computePathViaNextHop(flowItem.srcId, flowItem.dstId, flowItem.targetNextHop);
+        flowItem.targetPath = path;
+    }
+
+    renderMigrationTargetSetting();
+}
+
+function computePathViaNextHop(srcId, dstId, nextHopId) {
+    const link = links.find(l =>
+        (l.from === srcId && l.to === nextHopId) ||
+        (l.to === srcId && l.from === nextHopId)
+    );
+
+    if (!link || !link.enabled) {
+        return [srcId, dstId];
+    }
+
+    const tempDisable = [];
+    links.forEach(l => {
+        if (!l.enabled) tempDisable.push(l);
+        l.enabled = true;
+    });
+
+    const savedFrom = link.from;
+    const savedTo = link.to;
+    const savedEnabled = link.enabled;
+
+    const result = dijkstra(nextHopId);
+    const subPath = [];
+    let current = dstId;
+
+    while (current !== null && current !== undefined) {
+        subPath.unshift(current);
+        current = result.prev[current];
+    }
+
+    tempDisable.forEach(l => { l.enabled = false; });
+
+    if (subPath[0] === nextHopId) {
+        return [srcId, ...subPath];
+    }
+
+    return [srcId, dstId];
+}
+
+function editFlowTargetPath(index) {
+    const flowItem = selectedMigrationFlows[index];
+    alert('路径选择功能：在实际场景中可以通过点击拓扑中的节点来构建路径。\n\n当前使用最短路径作为默认目标路径。您可以通过指定下一跳的方式来改变路径。');
+}
+
+function renderMigrationBatches() {
+    const container = document.getElementById('migrationBatches');
+
+    if (migrationBatches.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">单批执行，所有流一起切换</p>';
+        return;
+    }
+
+    let html = '<div class="migration-batch-list">';
+
+    migrationBatches.forEach((batch, index) => {
+        html += `
+            <div class="migration-batch-item">
+                <div class="migration-batch-header">
+                    <span>第 ${index + 1} 批</span>
+                    <div class="migration-batch-actions">
+                        <button class="btn btn-small" onclick="removeBatch(${index})">删除</button>
+                    </div>
+                </div>
+                <div class="migration-batch-flows">
+                    ${batch.flowIndices?.length || 0} 条流
+                </div>
+            </div>
+        `;
+    });
+
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+function addBatch() {
+    if (selectedMigrationFlows.length === 0) {
+        alert('请先选择业务流');
+        return;
+    }
+
+    const batchNumber = migrationBatches.length + 1;
+    migrationBatches.push({
+        batchNumber,
+        flowIndices: [],
+        status: 'pending'
+    });
+
+    renderMigrationBatches();
+}
+
+function removeBatch(index) {
+    migrationBatches.splice(index, 1);
+    migrationBatches.forEach((b, i) => {
+        b.batchNumber = i + 1;
+    });
+    renderMigrationBatches();
+}
+
+async function previewMigration() {
+    const taskName = document.getElementById('migrationTaskName').value.trim();
+    if (!taskName) {
+        alert('请输入任务名称');
+        return;
+    }
+
+    if (selectedMigrationFlows.length === 0) {
+        alert('请至少选择一条业务流');
+        return;
+    }
+
+    selectedMigrationFlows.forEach((flow, index) => {
+        if (flow.targetType === 'path' && (!flow.targetPath || flow.targetPath.length < 2)) {
+            alert(`第 ${index + 1} 条流的目标路径无效`);
+            return;
+        }
+        if (flow.targetType === 'nexthop' && !flow.targetNextHop) {
+            alert(`第 ${index + 1} 条流请指定下一跳`);
+            return;
+        }
+    });
+
+    currentPreviewResult = runMigrationPreview();
+    renderPreviewResult();
+
+    document.getElementById('migrationPreviewSection').style.display = 'block';
+    document.getElementById('executeMigrationBtn').style.display = currentPreviewResult.passed ? 'inline-block' : 'none';
+}
+
+function runMigrationPreview() {
+    const result = {
+        passed: true,
+        unreachableFlows: [],
+        bandwidthViolations: [],
+        slaViolations: [],
+        totalFlows: selectedMigrationFlows.length
+    };
+
+    const linkBandwidthUsage = new Map();
+
+    links.forEach(link => {
+        const key = getLinkKey(link.from, link.to);
+        let currentUsage = 0;
+
+        trafficFlows.forEach(flow => {
+            if (isFlowUsingLink(flow, link)) {
+                currentUsage += flow.rate;
+            }
+        });
+
+        const isInMigration = selectedMigrationFlows.some(f =>
+            isFlowUsingLinkById(f.flowId, link)
+        );
+
+        if (!isInMigration) {
+            linkBandwidthUsage.set(key, currentUsage);
+        } else {
+            const origFlow = trafficFlows.find(f => f.id === f.flowId);
+            if (origFlow) {
+                linkBandwidthUsage.set(key, Math.max(0, currentUsage - origFlow.rate));
+            } else {
+                linkBandwidthUsage.set(key, currentUsage);
+            }
+        }
+    });
+
+    selectedMigrationFlows.forEach((flowItem, index) => {
+        const targetPath = flowItem.targetPath;
+        let isReachable = false;
+
+        if (targetPath && targetPath.length >= 2) {
+            isReachable = true;
+            for (let i = 0; i < targetPath.length - 1; i++) {
+                const link = findLink(targetPath[i], targetPath[i + 1]);
+                if (!link || !link.enabled) {
+                    isReachable = false;
+                    break;
+                }
+            }
+        }
+
+        if (!isReachable) {
+            result.unreachableFlows.push({
+                index,
+                flowId: flowItem.flowId,
+                src: flowItem.srcName || flowItem.srcId,
+                dst: flowItem.dstName || flowItem.dstId
+            });
+            result.passed = false;
+        } else {
+            for (let i = 0; i < targetPath.length - 1; i++) {
+                const key = getLinkKey(targetPath[i], targetPath[i + 1]);
+                const currentUsage = linkBandwidthUsage.get(key) || 0;
+                const newUsage = currentUsage + flowItem.rate;
+                linkBandwidthUsage.set(key, newUsage);
+            }
+        }
+    });
+
+    linkBandwidthUsage.forEach((usage, key) => {
+        const link = findLinkByKey(key);
+        if (link) {
+            const bandwidth = link.bandwidth || 100;
+            const utilization = (usage / bandwidth) * 100;
+
+            if (utilization > 100) {
+                result.bandwidthViolations.push({
+                    linkKey: key,
+                    linkName: getLinkDisplayNameById(key),
+                    bandwidth,
+                    usage,
+                    utilization: utilization.toFixed(1)
+                });
+                result.passed = false;
+            }
+        }
+    });
+
+    if (slaContracts && slaContracts.length > 0) {
+        slaContracts.forEach(contract => {
+            const migrationFlow = selectedMigrationFlows.find(f =>
+                f.srcId === contract.srcDeviceId && f.dstId === contract.dstDeviceId
+            );
+
+            if (migrationFlow) {
+                const pathLatency = calculatePathLatency(migrationFlow.targetPath);
+                const pathLossRate = calculatePathLossRate(migrationFlow.targetPath);
+                const pathBandwidth = calculatePathBandwidth(migrationFlow.targetPath);
+
+                let violated = false;
+                const breachTypes = [];
+
+                if (contract.maxLatency && pathLatency > contract.maxLatency) {
+                    violated = true;
+                    breachTypes.push({
+                        type: 'latency',
+                        expected: contract.maxLatency,
+                        actual: pathLatency.toFixed(2)
+                    });
+                }
+
+                if (contract.maxLossRate && pathLossRate > contract.maxLossRate) {
+                    violated = true;
+                    breachTypes.push({
+                        type: 'lossRate',
+                        expected: contract.maxLossRate,
+                        actual: pathLossRate.toFixed(2)
+                    });
+                }
+
+                if (contract.minBandwidth && pathBandwidth < contract.minBandwidth) {
+                    violated = true;
+                    breachTypes.push({
+                        type: 'bandwidth',
+                        expected: contract.minBandwidth,
+                        actual: pathBandwidth.toFixed(2)
+                    });
+                }
+
+                if (violated) {
+                    result.slaViolations.push({
+                        contractName: contract.name,
+                        src: getDeviceName(contract.srcDeviceId),
+                        dst: getDeviceName(contract.dstDeviceId),
+                        breachTypes
+                    });
+                    result.passed = false;
+                }
+            }
+        });
+    }
+
+    return result;
+}
+
+function isFlowUsingLink(flow, link) {
+    const path = getFlowCurrentPath(flow);
+    for (let i = 0; i < path.length - 1; i++) {
+        if (isSameLink(path[i], path[i + 1], link.from, link.to)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function isFlowUsingLinkById(flowId, link) {
+    const flow = trafficFlows.find(f => f.id === flowId);
+    if (!flow) return false;
+    return isFlowUsingLink(flow, link);
+}
+
+function isSameLink(a1, a2, b1, b2) {
+    return (a1 === b1 && a2 === b2) || (a1 === b2 && a2 === b1);
+}
+
+function getLinkKey(from, to) {
+    return from < to ? `${from}-${to}` : `${to}-${from}`;
+}
+
+function findLink(from, to) {
+    return links.find(l => isSameLink(from, to, l.from, l.to));
+}
+
+function findLinkByKey(key) {
+    const [from, to] = key.split('-').map(Number);
+    return findLink(from, to);
+}
+
+function getLinkDisplayNameById(key) {
+    const link = findLinkByKey(key);
+    if (!link) return key;
+    return getLinkDisplayName(link.from, link.to);
+}
+
+function calculatePathLatency(path) {
+    if (!path || path.length < 2) return 0;
+    let latency = 0;
+    for (let i = 0; i < path.length - 1; i++) {
+        const link = findLink(path[i], path[i + 1]);
+        if (link) {
+            latency += link.delay || 10;
+        }
+    }
+    return latency;
+}
+
+function calculatePathLossRate(path) {
+    if (!path || path.length < 2) return 0;
+    let lossRate = 0;
+    for (let i = 0; i < path.length - 1; i++) {
+        const link = findLink(path[i], path[i + 1]);
+        if (link) {
+            lossRate += link.lossRate || 0;
+        }
+    }
+    return Math.min(lossRate, 100);
+}
+
+function calculatePathBandwidth(path) {
+    if (!path || path.length < 2) return Infinity;
+    let minBandwidth = Infinity;
+    for (let i = 0; i < path.length - 1; i++) {
+        const link = findLink(path[i], path[i + 1]);
+        if (link) {
+            minBandwidth = Math.min(minBandwidth, link.bandwidth || 100);
+        }
+    }
+    return minBandwidth === Infinity ? 0 : minBandwidth;
+}
+
+function renderPreviewResult() {
+    const statusEl = document.getElementById('migrationPreviewStatus');
+    const resultEl = document.getElementById('migrationPreviewResult');
+
+    if (!currentPreviewResult) return;
+
+    statusEl.textContent = currentPreviewResult.passed ? '✓ 预演通过' : '✗ 预演未通过';
+    statusEl.className = 'migration-preview-status ' + (currentPreviewResult.passed ? 'passed' : 'failed');
+
+    let html = '';
+
+    if (currentPreviewResult.unreachableFlows.length > 0) {
+        html += `
+            <div class="preview-alert-section error">
+                <h5>❌ 不可达的流 (${currentPreviewResult.unreachableFlows.length})</h5>
+                <ul>
+                    ${currentPreviewResult.unreachableFlows.map(f => `
+                        <li>${f.src} → ${f.dst}</li>
+                    `).join('')}
+                </ul>
+            </div>
+        `;
+    }
+
+    if (currentPreviewResult.bandwidthViolations.length > 0) {
+        html += `
+            <div class="preview-alert-section warning">
+                <h5>⚠️ 带宽超限链路 (${currentPreviewResult.bandwidthViolations.length})</h5>
+                <ul>
+                    ${currentPreviewResult.bandwidthViolations.map(v => `
+                        <li>
+                            ${v.linkName}: ${v.usage.toFixed(1)} / ${v.bandwidth} Mbps (${v.utilization}%)
+                        </li>
+                    `).join('')}
+                </ul>
+            </div>
+        `;
+    }
+
+    if (currentPreviewResult.slaViolations.length > 0) {
+        html += `
+            <div class="preview-alert-section error">
+                <h5>❌ SLA违约 (${currentPreviewResult.slaViolations.length})</h5>
+                <ul>
+                    ${currentPreviewResult.slaViolations.map(v => `
+                        <li>
+                            <strong>${v.contractName}</strong> (${v.src} → ${v.dst})
+                            <ul>
+                                ${v.breachTypes.map(b => `
+                                    <li>${getBreachTypeName(b.type)}: 预期 ${b.expected}，实际 ${b.actual}</li>
+                                `).join('')}
+                            </ul>
+                        </li>
+                    `).join('')}
+                </ul>
+            </div>
+        `;
+    }
+
+    if (currentPreviewResult.passed) {
+        html += `
+            <div class="preview-success-section">
+                <p>✅ 所有检查项通过，可以执行迁移</p>
+                <p class="hint">共 ${currentPreviewResult.totalFlows} 条业务流参与迁移</p>
+            </div>
+        `;
+    }
+
+    resultEl.innerHTML = html;
+}
+
+function getBreachTypeName(type) {
+    const names = {
+        latency: '延迟',
+        lossRate: '丢包率',
+        bandwidth: '带宽'
+    };
+    return names[type] || type;
+}
+
+async function saveMigrationDraft() {
+    const taskName = document.getElementById('migrationTaskName').value.trim();
+    const taskDesc = document.getElementById('migrationTaskDesc').value.trim();
+
+    if (!taskName) {
+        alert('请输入任务名称');
+        return;
+    }
+
+    const snapshot = captureTopologySnapshot();
+
+    const taskData = {
+        name: taskName,
+        description: taskDesc,
+        flows: selectedMigrationFlows,
+        batches: migrationBatches.length > 0 ? migrationBatches : null,
+        previewResult: currentPreviewResult,
+        preMigrationSnapshot: snapshot
+    };
+
+    try {
+        const result = await apiRequest('/migration/tasks', 'POST', taskData);
+        if (result.success) {
+            addLog(`迁移任务草稿已保存: ${taskName}`, 'success');
+            loadMigrationTaskList();
+        }
+    } catch (err) {
+        console.error('保存失败:', err);
+        alert('保存失败: ' + err.message);
+    }
+}
+
+function captureTopologySnapshot() {
+    return {
+        devices: JSON.parse(JSON.stringify(devices)),
+        links: JSON.parse(JSON.stringify(links)),
+        manualRoutes: JSON.parse(JSON.stringify(manualRoutes)),
+        trafficFlows: JSON.parse(JSON.stringify(trafficFlows)),
+        timestamp: Date.now()
+    };
+}
+
+async function executeMigration() {
+    if (!currentPreviewResult || !currentPreviewResult.passed) {
+        alert('预演未通过，无法执行迁移');
+        return;
+    }
+
+    if (!confirm('确定要执行迁移吗？执行过程中如果出现问题可以回滚。')) {
+        return;
+    }
+
+    preMigrationSnapshot = captureTopologySnapshot();
+    isMigrationExecuting = true;
+    document.getElementById('executeMigrationBtn').disabled = true;
+    document.getElementById('previewMigrationBtn').disabled = true;
+
+    addLog('开始执行业务流迁移', 'info');
+
+    try {
+        if (migrationBatches.length === 0) {
+            await executeBatch(selectedMigrationFlows);
+            addLog('迁移执行完成', 'success');
+        } else {
+            for (let i = 0; i < migrationBatches.length; i++) {
+                if (!isMigrationExecuting) break;
+
+                currentExecutingBatch = migrationBatches[i];
+                const batchFlows = migrationBatches[i].flowIndices?.map(idx => selectedMigrationFlows[idx]) || [];
+
+                addLog(`开始执行第 ${i + 1} 批迁移 (${batchFlows.length} 条流)`, 'info');
+                await executeBatch(batchFlows);
+
+                if (i < migrationBatches.length - 1) {
+                    const continueResult = checkCanContinueMigration();
+                    if (!continueResult.canContinue) {
+                        isMigrationExecuting = false;
+                        alert(`第 ${i + 1} 批执行后检测到问题，已暂停后续批次：\n${continueResult.reason}\n\n您可以选择回滚或继续。`);
+                        showRollbackOption();
+                        return;
+                    }
+                }
+            }
+
+            if (isMigrationExecuting) {
+                addLog('所有批次迁移执行完成', 'success');
+            }
+        }
+
+        const postSnapshot = captureTopologySnapshot();
+        saveCompletedMigrationTask(postSnapshot);
+
+    } catch (err) {
+        console.error('迁移执行失败:', err);
+        addLog('迁移执行失败: ' + err.message, 'error');
+    } finally {
+        isMigrationExecuting = false;
+        currentExecutingBatch = null;
+        document.getElementById('executeMigrationBtn').disabled = false;
+        document.getElementById('previewMigrationBtn').disabled = false;
+    }
+}
+
+async function executeBatch(flows) {
+    return new Promise((resolve) => {
+        setTimeout(() => {
+            flows.forEach(flowItem => {
+                const flow = trafficFlows.find(f => f.id === flowItem.flowId);
+                if (flow && flowItem.targetPath) {
+                    flow.manualPath = flowItem.targetPath;
+                }
+            });
+
+            updateLinkCongestion();
+            checkFlowCompletion();
+            render();
+            updateQosStats();
+
+            resolve();
+        }, 500);
+    });
+}
+
+function checkCanContinueMigration() {
+    const result = {
+        canContinue: true,
+        reason: ''
+    };
+
+    const unreachableFlows = [];
+    trafficFlows.forEach(flow => {
+        if (!isFlowReachable(flow)) {
+            const srcDev = devices.find(d => d.id === flow.srcId);
+            const dstDev = devices.find(d => d.id === flow.dstId);
+            unreachableFlows.push(`${srcDev?.name || flow.srcId} → ${dstDev?.name || flow.dstId}`);
+        }
+    });
+
+    if (unreachableFlows.length > 0) {
+        result.canContinue = false;
+        result.reason = `检测到 ${unreachableFlows.length} 条不可达的流：\n${unreachableFlows.slice(0, 3).join('\n')}${unreachableFlows.length > 3 ? '\n...' : ''}`;
+        return result;
+    }
+
+    if (slaContracts && slaContracts.length > 0) {
+        const breachedContracts = [];
+        slaContracts.forEach(contract => {
+            if (isSlaContractBreached(contract)) {
+                breachedContracts.push(contract.name);
+            }
+        });
+
+        if (breachedContracts.length > 0) {
+            result.canContinue = false;
+            result.reason = `检测到 ${breachedContracts.length} 个SLA合约违约：\n${breachedContracts.slice(0, 3).join('\n')}${breachedContracts.length > 3 ? '\n...' : ''}`;
+            return result;
+        }
+    }
+
+    return result;
+}
+
+function isFlowReachable(flow) {
+    const result = dijkstra(flow.srcId);
+    return result.dist[flow.dstId] !== Infinity;
+}
+
+function isSlaContractBreached(contract) {
+    const result = dijkstra(contract.srcDeviceId);
+    if (result.dist[contract.dstDeviceId] === Infinity) {
+        return true;
+    }
+
+    if (contract.maxLatency && result.dist[contract.dstDeviceId] > contract.maxLatency) {
+        return true;
+    }
+
+    return false;
+}
+
+function showRollbackOption() {
+    if (confirm('是否回滚到迁移前状态？')) {
+        rollbackMigration();
+    }
+}
+
+function rollbackMigration() {
+    if (!preMigrationSnapshot) {
+        alert('没有迁移前的快照，无法回滚');
+        return;
+    }
+
+    if (!confirm('确定要回滚到迁移前的状态吗？')) {
+        return;
+    }
+
+    devices = preMigrationSnapshot.devices;
+    links = preMigrationSnapshot.links;
+    manualRoutes = preMigrationSnapshot.manualRoutes;
+    trafficFlows = preMigrationSnapshot.trafficFlows;
+
+    trafficFlows.forEach(flow => {
+        delete flow.manualPath;
+    });
+
+    updateDeviceSelects();
+    calculatePartitions();
+    updateLinkCongestion();
+    render();
+    updatePropertyPanel();
+    updateRoutingTable();
+    updateQosStats();
+    updateTrafficList();
+
+    isMigrationExecuting = false;
+    addLog('已回滚到迁移前状态', 'warning');
+    alert('回滚完成');
+}
+
+async function saveCompletedMigrationTask(postSnapshot) {
+    const taskName = document.getElementById('migrationTaskName').value.trim();
+    const taskDesc = document.getElementById('migrationTaskDesc').value.trim();
+
+    const taskData = {
+        name: taskName || ('迁移任务_' + Date.now()),
+        description: taskDesc,
+        flows: selectedMigrationFlows.map(f => ({ ...f, status: 'completed' })),
+        batches: migrationBatches.length > 0 ? migrationBatches.map(b => ({ ...b, status: 'completed' })) : null,
+        previewResult: currentPreviewResult,
+        preMigrationSnapshot: preMigrationSnapshot,
+        postMigrationSnapshot: postSnapshot
+    };
+
+    try {
+        const result = await apiRequest('/migration/tasks', 'POST', taskData);
+        if (result.success) {
+            addLog('迁移任务已保存到历史记录', 'success');
+            loadMigrationTaskList();
+            loadMigrationHistory();
+        }
+    } catch (err) {
+        console.error('保存迁移任务失败:', err);
+    }
+}
+
+async function loadMigrationTaskList() {
+    const container = document.getElementById('migrationTaskList');
+
+    try {
+        const result = await apiRequest('/migration/tasks');
+        if (result.success) {
+            const tasks = result.data.slice(0, 10);
+
+            if (tasks.length === 0) {
+                container.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">暂无历史任务</p>';
+                return;
+            }
+
+            let html = '';
+            tasks.forEach(task => {
+                const date = new Date(task.createdAt).toLocaleDateString();
+                const statusMap = {
+                    'draft': '草稿',
+                    'running': '执行中',
+                    'completed': '已完成',
+                    'failed': '失败',
+                    'paused': '已暂停'
+                };
+
+                html += `
+                    <div class="migration-task-item" onclick="viewMigrationTaskDetail(${task.id})">
+                        <div class="migration-task-name">${escapeHtml(task.name)}</div>
+                        <div class="migration-task-meta">
+                            <span class="migration-task-status ${task.status}">${statusMap[task.status] || task.status}</span>
+                            <span>${date}</span>
+                        </div>
+                    </div>
+                `;
+            });
+
+            container.innerHTML = html;
+        }
+    } catch (err) {
+        container.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">加载失败</p>';
+    }
+}
+
+async function loadMigrationHistory() {
+    const container = document.getElementById('migrationHistoryList');
+
+    try {
+        const result = await apiRequest('/migration/tasks');
+        if (result.success) {
+            migrationHistory = result.data;
+
+            if (migrationHistory.length === 0) {
+                container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:20px 0;">暂无历史迁移任务</p>';
+                return;
+            }
+
+            let html = '<div class="migration-history-list">';
+
+            migrationHistory.forEach(task => {
+                const date = new Date(task.createdAt).toLocaleString();
+                const statusMap = {
+                    'draft': '草稿',
+                    'running': '执行中',
+                    'completed': '已完成',
+                    'failed': '失败',
+                    'paused': '已暂停'
+                };
+
+                html += `
+                    <div class="migration-history-item">
+                        <div class="migration-history-header">
+                            <span class="migration-history-name">${escapeHtml(task.name)}</span>
+                            <span class="migration-history-status ${task.status}">${statusMap[task.status] || task.status}</span>
+                        </div>
+                        <div class="migration-history-meta">
+                            <span>${task.totalFlows} 条流</span>
+                            <span>${task.totalBatches || 1} 批</span>
+                            <span>${date}</span>
+                        </div>
+                        <div class="migration-history-actions">
+                            <button class="btn btn-small" onclick="viewMigrationTaskDetail(${task.id})">查看详情</button>
+                            ${task.status === 'completed' ? `
+                                <button class="btn btn-small btn-primary" onclick="duplicateMigrationTask(${task.id})">复制为新任务</button>
+                            ` : ''}
+                        </div>
+                    </div>
+                `;
+            });
+
+            html += '</div>';
+            container.innerHTML = html;
+        }
+    } catch (err) {
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:20px 0;">加载失败</p>';
+    }
+}
+
+async function viewMigrationTaskDetail(taskId) {
+    try {
+        const result = await apiRequest('/migration/tasks/' + taskId);
+        if (result.success) {
+            const task = result.data;
+            renderMigrationDetail(task);
+        }
+    } catch (err) {
+        alert('获取任务详情失败: ' + err.message);
+    }
+}
+
+function renderMigrationDetail(task) {
+    document.getElementById('migrationDetailTitle').textContent = task.name;
+    document.getElementById('migrationDetailView').style.display = 'block';
+    document.querySelectorAll('.migration-tab-content').forEach(c => c.style.display = 'none');
+
+    const statusMap = {
+        'draft': '草稿',
+        'running': '执行中',
+        'completed': '已完成',
+        'failed': '失败',
+        'paused': '已暂停'
+    };
+
+    let html = `
+        <div class="migration-detail-section">
+            <h4>基本信息</h4>
+            <div class="detail-row">
+                <span class="detail-label">任务状态</span>
+                <span class="migration-task-status ${task.status}">${statusMap[task.status] || task.status}</span>
+            </div>
+            <div class="detail-row">
+                <span class="detail-label">创建时间</span>
+                <span>${new Date(task.createdAt).toLocaleString()}</span>
+            </div>
+            ${task.startedAt ? `
+                <div class="detail-row">
+                    <span class="detail-label">开始时间</span>
+                    <span>${new Date(task.startedAt).toLocaleString()}</span>
+                </div>
+            ` : ''}
+            ${task.finishedAt ? `
+                <div class="detail-row">
+                    <span class="detail-label">完成时间</span>
+                    <span>${new Date(task.finishedAt).toLocaleString()}</span>
+                </div>
+            ` : ''}
+            ${task.description ? `
+                <div class="detail-row">
+                    <span class="detail-label">描述</span>
+                    <span>${escapeHtml(task.description)}</span>
+                </div>
+            ` : ''}
+        </div>
+
+        <div class="migration-detail-section">
+            <h4>迁移流列表 (${task.flows?.length || 0} 条)</h4>
+            <div class="migration-flows-detail">
+    `;
+
+    if (task.flows && task.flows.length > 0) {
+        task.flows.forEach((flow, index) => {
+            html += `
+                <div class="migration-flow-detail-item">
+                    <div class="flow-detail-header">
+                        <span class="flow-detail-title">
+                            ${flow.srcName || flow.srcId} → ${flow.dstName || flow.dstId}
+                        </span>
+                        <span class="flow-detail-rate">${flow.rate} Mbps</span>
+                    </div>
+                    <div class="flow-detail-paths">
+                        <div class="flow-path-row">
+                            <span class="path-label">原路径:</span>
+                            <span class="path-content">${formatPath(flow.originalPath) || '-'}</span>
+                        </div>
+                        <div class="flow-path-row">
+                            <span class="path-label">目标路径:</span>
+                            <span class="path-content">${formatPath(flow.targetPath) || '-'}</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        });
+    } else {
+        html += '<p class="hint">暂无流数据</p>';
+    }
+
+    html += `
+            </div>
+        </div>
+    `;
+
+    if (task.previewResult) {
+        html += `
+            <div class="migration-detail-section">
+                <h4>预演结果</h4>
+                <div class="preview-result-detail">
+                    <p>${task.previewResult.passed ? '✅ 预演通过' : '❌ 预演未通过'}</p>
+                    ${task.previewResult.unreachableFlows?.length > 0 ? `
+                        <p>不可达流: ${task.previewResult.unreachableFlows.length} 条</p>
+                    ` : ''}
+                    ${task.previewResult.bandwidthViolations?.length > 0 ? `
+                        <p>带宽超限链路: ${task.previewResult.bandwidthViolations.length} 条</p>
+                    ` : ''}
+                    ${task.previewResult.slaViolations?.length > 0 ? `
+                        <p>SLA违约: ${task.previewResult.slaViolations.length} 项</p>
+                    ` : ''}
+                </div>
+            </div>
+        `;
+    }
+
+    if (task.status === 'completed') {
+        html += `
+            <div class="migration-detail-actions">
+                <button class="btn btn-primary" onclick="duplicateMigrationTask(${task.id})">复制为新任务</button>
+                <button class="btn btn-danger" onclick="deleteMigrationTask(${task.id})">删除任务</button>
+            </div>
+        `;
+    }
+
+    document.getElementById('migrationDetailContent').innerHTML = html;
+}
+
+function backFromMigrationDetail() {
+    document.getElementById('migrationDetailView').style.display = 'none';
+    const activeTab = document.querySelector('.migration-tab.active')?.dataset.migrationTab || 'create';
+    document.getElementById('migration-tab-' + activeTab).style.display = 'block';
+}
+
+async function duplicateMigrationTask(taskId) {
+    try {
+        const result = await apiRequest('/migration/tasks/' + taskId + '/duplicate', 'POST', {});
+        if (result.success) {
+            addLog(`已复制迁移任务: ${result.data.name}`, 'success');
+            alert('复制成功！新任务已保存为草稿。');
+
+            const detailResult = await apiRequest('/migration/tasks/' + result.data.id);
+            if (detailResult.success) {
+                const task = detailResult.data;
+                document.getElementById('migrationTaskName').value = task.name;
+                document.getElementById('migrationTaskDesc').value = task.description || '';
+
+                selectedMigrationFlows = task.flows || [];
+                migrationBatches = task.batches || [];
+
+                renderMigrationFlowSelect();
+                renderMigrationTargetSetting();
+                renderMigrationBatches();
+                updateMigrationFlowCount();
+
+                switchMigrationTab('create');
+                backFromMigrationDetail();
+            }
+        }
+    } catch (err) {
+        alert('复制失败: ' + err.message);
+    }
+}
+
+async function deleteMigrationTask(taskId) {
+    if (!confirm('确定要删除这个迁移任务吗？')) return;
+
+    try {
+        const result = await apiRequest('/migration/tasks/' + taskId, 'DELETE');
+        if (result.success) {
+            addLog('迁移任务已删除', 'info');
+            backFromMigrationDetail();
+            loadMigrationHistory();
+            loadMigrationTaskList();
+        }
+    } catch (err) {
+        alert('删除失败: ' + err.message);
+    }
+}
+
+function initMigrationModule() {
+    document.getElementById('openMigrationModalBtn').addEventListener('click', openMigrationModal);
+    document.getElementById('closeMigrationModal').addEventListener('click', closeMigrationModal);
+    document.getElementById('refreshMigrationListBtn').addEventListener('click', loadMigrationTaskList);
+    document.getElementById('previewMigrationBtn').addEventListener('click', previewMigration);
+    document.getElementById('executeMigrationBtn').addEventListener('click', executeMigration);
+    document.getElementById('saveMigrationDraftBtn').addEventListener('click', saveMigrationDraft);
+    document.getElementById('addBatchBtn').addEventListener('click', addBatch);
+    document.getElementById('backFromDetailBtn').addEventListener('click', backFromMigrationDetail);
+
+    document.querySelectorAll('.migration-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            switchMigrationTab(tab.dataset.migrationTab);
+        });
+    });
+
+    document.getElementById('migrationModal').addEventListener('click', (e) => {
+        if (e.target.id === 'migrationModal') {
+            closeMigrationModal();
+        }
+    });
+}
+
+window.toggleMigrationFlow = toggleMigrationFlow;
+window.setFlowTargetType = setFlowTargetType;
+window.setFlowTargetNextHop = setFlowTargetNextHop;
+window.editFlowTargetPath = editFlowTargetPath;
+window.addBatch = addBatch;
+window.removeBatch = removeBatch;
+window.viewMigrationTaskDetail = viewMigrationTaskDetail;
+window.duplicateMigrationTask = duplicateMigrationTask;
+window.deleteMigrationTask = deleteMigrationTask;
+window.backFromMigrationDetail = backFromMigrationDetail;
+
 init();
+
+initMigrationModule();

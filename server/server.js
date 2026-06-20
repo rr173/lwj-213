@@ -26,7 +26,15 @@ const {
   deleteTrafficRecording,
   compareTrafficRecordings,
   saveSlaEvent,
-  listSlaEvents
+  listSlaEvents,
+  saveMigrationTask,
+  listMigrationTasks,
+  getMigrationTask,
+  updateMigrationTask,
+  updateMigrationBatch,
+  updateMigrationFlow,
+  deleteMigrationTask,
+  duplicateMigrationTask
 } = require('./database');
 
 const app = express();
@@ -490,6 +498,164 @@ app.get('/api/sla/events', async (req, res) => {
   } catch (err) {
     console.error('获取SLA事件列表失败:', err);
     res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.post('/api/migration/tasks', async (req, res) => {
+  try {
+    const { name, description, batches, flows, previewResult, preMigrationSnapshot } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: '缺少必要字段: name' });
+    }
+
+    const result = await saveMigrationTask({
+      name,
+      description,
+      batches,
+      flows,
+      previewResult,
+      preMigrationSnapshot
+    });
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('创建迁移任务失败:', err);
+    res.status(500).json({ error: '创建失败' });
+  }
+});
+
+app.get('/api/migration/tasks', async (req, res) => {
+  try {
+    const tasks = await listMigrationTasks();
+    res.json({
+      success: true,
+      data: tasks
+    });
+  } catch (err) {
+    console.error('获取迁移任务列表失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.get('/api/migration/tasks/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的任务ID' });
+    }
+
+    const task = await getMigrationTask(id);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: task
+    });
+  } catch (err) {
+    console.error('获取迁移任务详情失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.put('/api/migration/tasks/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的任务ID' });
+    }
+
+    const result = await updateMigrationTask(id, req.body);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('更新迁移任务失败:', err);
+    res.status(500).json({ error: '更新失败' });
+  }
+});
+
+app.delete('/api/migration/tasks/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的任务ID' });
+    }
+
+    const result = await deleteMigrationTask(id);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('删除迁移任务失败:', err);
+    res.status(500).json({ error: '删除失败' });
+  }
+});
+
+app.post('/api/migration/tasks/:id/duplicate', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的任务ID' });
+    }
+
+    const { newName } = req.body || {};
+    const result = await duplicateMigrationTask(id, newName);
+
+    if (!result) {
+      return res.status(404).json({ error: '原任务不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('复制迁移任务失败:', err);
+    res.status(500).json({ error: '复制失败' });
+  }
+});
+
+app.put('/api/migration/batches/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的批次ID' });
+    }
+
+    const result = await updateMigrationBatch(id, req.body);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('更新迁移批次失败:', err);
+    res.status(500).json({ error: '更新失败' });
+  }
+});
+
+app.put('/api/migration/flows/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的流ID' });
+    }
+
+    const result = await updateMigrationFlow(id, req.body);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('更新迁移流失败:', err);
+    res.status(500).json({ error: '更新失败' });
   }
 });
 
