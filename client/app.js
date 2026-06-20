@@ -6290,7 +6290,7 @@ function renderMigrationFlowSelect() {
                         ${srcDev?.name || flow.srcId} → ${dstDev?.name || flow.dstId}
                     </div>
                     <div class="migration-flow-subtitle">
-                        ${flow.rate} Mbps · ${flow.priority === 'priority' ? '优先' : '普通'}
+                        ${(flow.rate / 1000000).toFixed(1)} Mbps · ${flow.priority === 'priority' ? '优先' : '普通'}
                     </div>
                 </div>
             </div>
@@ -6384,7 +6384,7 @@ function renderMigrationTargetSetting() {
                     <span class="migration-target-title">
                         ${flowItem.srcName || flowItem.srcId} → ${flowItem.dstName || flowItem.dstId}
                     </span>
-                    <span class="migration-target-rate">${flowItem.rate} Mbps</span>
+                    <span class="migration-target-rate">${(flowItem.rate / 1000000).toFixed(1)} Mbps</span>
                 </div>
                 <div class="migration-target-type">
                     <label>
@@ -6611,11 +6611,11 @@ function runMigrationPreview() {
 
     links.forEach(link => {
         const key = getLinkKey(link.from, link.to);
-        let currentUsage = 0;
+        let currentUsageMbps = 0;
 
         trafficFlows.forEach(flow => {
             if (isFlowUsingLink(flow, link)) {
-                currentUsage += flow.rate;
+                currentUsageMbps += flow.rate / 1000000;
             }
         });
 
@@ -6624,13 +6624,13 @@ function runMigrationPreview() {
         );
 
         if (!isInMigration) {
-            linkBandwidthUsage.set(key, currentUsage);
+            linkBandwidthUsage.set(key, currentUsageMbps);
         } else {
             const origFlow = trafficFlows.find(f => f.id === f.flowId);
             if (origFlow) {
-                linkBandwidthUsage.set(key, Math.max(0, currentUsage - origFlow.rate));
+                linkBandwidthUsage.set(key, Math.max(0, currentUsageMbps - origFlow.rate / 1000000));
             } else {
-                linkBandwidthUsage.set(key, currentUsage);
+                linkBandwidthUsage.set(key, currentUsageMbps);
             }
         }
     });
@@ -6659,27 +6659,28 @@ function runMigrationPreview() {
             });
             result.passed = false;
         } else {
+            const flowRateMbps = flowItem.rate / 1000000;
             for (let i = 0; i < targetPath.length - 1; i++) {
                 const key = getLinkKey(targetPath[i], targetPath[i + 1]);
-                const currentUsage = linkBandwidthUsage.get(key) || 0;
-                const newUsage = currentUsage + flowItem.rate;
-                linkBandwidthUsage.set(key, newUsage);
+                const currentUsageMbps = linkBandwidthUsage.get(key) || 0;
+                const newUsageMbps = currentUsageMbps + flowRateMbps;
+                linkBandwidthUsage.set(key, newUsageMbps);
             }
         }
     });
 
-    linkBandwidthUsage.forEach((usage, key) => {
+    linkBandwidthUsage.forEach((usageMbps, key) => {
         const link = findLinkByKey(key);
         if (link) {
-            const bandwidth = link.bandwidth || 100;
-            const utilization = (usage / bandwidth) * 100;
+            const bandwidthMbps = link.bandwidth || 100;
+            const utilization = (usageMbps / bandwidthMbps) * 100;
 
             if (utilization > 100) {
                 result.bandwidthViolations.push({
                     linkKey: key,
                     linkName: getLinkDisplayNameById(key),
-                    bandwidth,
-                    usage,
+                    bandwidth: bandwidthMbps,
+                    usage: usageMbps,
                     utilization: utilization.toFixed(1)
                 });
                 result.passed = false;
@@ -6779,8 +6780,20 @@ function findLinkByKey(key) {
 
 function getLinkDisplayNameById(key) {
     const link = findLinkByKey(key);
-    if (!link) return key;
-    return getLinkDisplayName(link.from, link.to);
+    if (link) {
+        const from = devices.find(d => d.id === link.from);
+        const to = devices.find(d => d.id === link.to);
+        return `${from?.name || link.from} - ${to?.name || link.to}`;
+    }
+    const parts = key.split('-');
+    if (parts.length === 2) {
+        const fromId = parseInt(parts[0]);
+        const toId = parseInt(parts[1]);
+        const from = devices.find(d => d.id === fromId);
+        const to = devices.find(d => d.id === toId);
+        return `${from?.name || fromId} - ${to?.name || toId}`;
+    }
+    return key;
 }
 
 function calculatePathLatency(path) {
@@ -7309,7 +7322,7 @@ function renderMigrationDetail(task) {
                         <span class="flow-detail-title">
                             ${flow.srcName || flow.srcId} → ${flow.dstName || flow.dstId}
                         </span>
-                        <span class="flow-detail-rate">${flow.rate} Mbps</span>
+                        <span class="flow-detail-rate">${(flow.rate / 1000000).toFixed(1)} Mbps</span>
                     </div>
                     <div class="flow-detail-paths">
                         <div class="flow-path-row">
