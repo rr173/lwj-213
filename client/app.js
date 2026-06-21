@@ -10759,3 +10759,1028 @@ window.removeCiOperation = removeCiOperation;
 window.viewCiHistoryDetail = viewCiHistoryDetail;
 
 initChangeImpactModule();
+
+// ==================== 子网模板库功能 ====================
+
+let templateState = {
+    isSelectMode: false,
+    isSelecting: false,
+    selectStart: { x: 0, y: 0 },
+    selectEnd: { x: 0, y: 0 },
+    selectedDevices: new Set(),
+    selectedLinks: new Set(),
+    connectionPoints: new Set(),
+    templates: [],
+    currentCreatingTemplate: null,
+    currentDeployingTemplate: null,
+    currentPreviewingTemplate: null,
+    deploymentHistory: [],
+    pendingDeployParams: {},
+    selectionRect: null
+};
+
+const originalInit4 = init;
+init = function() {
+    originalInit4();
+    setupTemplateEvents();
+    loadTemplates();
+    loadDeploymentHistory();
+};
+
+function setupTemplateEvents() {
+    document.getElementById('enterSelectModeBtn').addEventListener('click', enterSelectMode);
+    document.getElementById('exitSelectModeBtn').addEventListener('click', exitSelectMode);
+    document.getElementById('saveAsTemplateBtn').addEventListener('click', openCreateTemplateModal);
+    document.getElementById('markConnectionPointBtn').addEventListener('click', toggleConnectionPoint);
+    document.getElementById('refreshTemplatesBtn').addEventListener('click', loadTemplates);
+    document.getElementById('refreshDeploymentHistoryBtn').addEventListener('click', loadDeploymentHistory);
+    
+    document.getElementById('cancelCreateTemplate').addEventListener('click', closeCreateTemplateModal);
+    document.getElementById('confirmCreateTemplate').addEventListener('click', confirmCreateTemplate);
+    
+    document.getElementById('cancelDeployTemplate').addEventListener('click', closeDeployTemplateModal);
+    document.getElementById('confirmDeployTemplate').addEventListener('click', confirmDeployTemplate);
+    
+    document.getElementById('closePreviewTemplate').addEventListener('click', closePreviewTemplateModal);
+    document.getElementById('renameTemplateBtn').addEventListener('click', saveTemplateRename);
+    document.getElementById('deleteTemplateBtn').addEventListener('click', deleteCurrentTemplate);
+    
+    document.getElementById('closeConnectionPointHint').addEventListener('click', () => {
+        document.getElementById('connectionPointHint').style.display = 'none';
+    });
+    
+    const origCanvasMouseDown = setupCanvasEvents;
+    setupCanvasEvents = function() {
+        origCanvasMouseDown();
+        
+        canvas.addEventListener('mousedown', handleTemplateMouseDown, true);
+        canvas.addEventListener('mousemove', handleTemplateMouseMove, true);
+        canvas.addEventListener('mouseup', handleTemplateMouseUp, true);
+    };
+}
+
+function enterSelectMode() {
+    if (isPlayback) {
+        addLog('回放模式下无法创建模板', 'warning');
+        return;
+    }
+    
+    templateState.isSelectMode = true;
+    templateState.selectedDevices.clear();
+    templateState.selectedLinks.clear();
+    templateState.connectionPoints.clear();
+    
+    document.getElementById('enterSelectModeBtn').style.display = 'none';
+    document.getElementById('exitSelectModeBtn').style.display = 'block';
+    document.getElementById('templateSelectionInfo').style.display = 'block';
+    document.getElementById('templateCreateActions').style.display = 'flex';
+    document.getElementById('templateCreateActions').style.gap = '4px';
+    
+    canvas.style.cursor = 'crosshair';
+    updateSelectionInfo();
+    addLog('已进入框选模式，拖动鼠标框选设备', 'info');
+}
+
+function exitSelectMode() {
+    templateState.isSelectMode = false;
+    templateState.isSelecting = false;
+    templateState.selectedDevices.clear();
+    templateState.selectedLinks.clear();
+    templateState.connectionPoints.clear();
+    
+    if (templateState.selectionRect) {
+        templateState.selectionRect.remove();
+        templateState.selectionRect = null;
+    }
+    
+    document.getElementById('enterSelectModeBtn').style.display = 'block';
+    document.getElementById('exitSelectModeBtn').style.display = 'none';
+    document.getElementById('templateSelectionInfo').style.display = 'none';
+    document.getElementById('templateCreateActions').style.display = 'none';
+    
+    canvas.style.cursor = 'default';
+    addLog('已退出框选模式', 'info');
+}
+
+function handleTemplateMouseDown(e) {
+    if (!templateState.isSelectMode) return;
+    if (e.button !== 0) return;
+    
+    e.stopPropagation();
+    
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const worldPos = screenToWorld(x, y);
+    
+    const device = getDeviceAt(worldPos.x, worldPos.y);
+    
+    if (device) {
+        if (e.shiftKey || e.ctrlKey) {
+            if (templateState.selectedDevices.has(device.id)) {
+                templateState.selectedDevices.delete(device.id);
+                templateState.connectionPoints.delete(device.id);
+            } else {
+                templateState.selectedDevices.add(device.id);
+            }
+        } else {
+            if (!templateState.selectedDevices.has(device.id)) {
+                templateState.selectedDevices.clear();
+                templateState.connectionPoints.clear();
+            }
+            templateState.selectedDevices.add(device.id);
+        }
+        updateSelectedLinks();
+        updateSelectionInfo();
+    } else {
+        templateState.isSelecting = true;
+        templateState.selectStart = { x, y };
+        templateState.selectEnd = { x, y };
+        
+        if (!templateState.selectionRect) {
+            templateState.selectionRect = document.createElement('div');
+            templateState.selectionRect.className = 'selection-rect';
+            canvas.parentElement.appendChild(templateState.selectionRect);
+        }
+        updateSelectionRect();
+    }
+}
+
+function handleTemplateMouseMove(e) {
+    if (!templateState.isSelectMode || !templateState.isSelecting) return;
+    
+    e.stopPropagation();
+    
+    const rect = canvas.getBoundingClientRect();
+    templateState.selectEnd = {
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top
+    };
+    
+    updateSelectionRect();
+}
+
+function handleTemplateMouseUp(e) {
+    if (!templateState.isSelectMode) return;
+    if (e.button !== 0) return;
+    
+    e.stopPropagation();
+    
+    if (templateState.isSelecting) {
+        templateState.isSelecting = false;
+        
+        if (templateState.selectionRect) {
+            templateState.selectionRect.remove();
+            templateState.selectionRect = null;
+        }
+        
+        const rect = canvas.getBoundingClientRect();
+        const startWorld = screenToWorld(templateState.selectStart.x, templateState.selectStart.y);
+        const endWorld = screenToWorld(templateState.selectEnd.x, templateState.selectEnd.y);
+        
+        const minX = Math.min(startWorld.x, endWorld.x);
+        const maxX = Math.max(startWorld.x, endWorld.x);
+        const minY = Math.min(startWorld.y, endWorld.y);
+        const maxY = Math.max(startWorld.y, endWorld.y);
+        
+        if (Math.abs(maxX - minX) > 5 || Math.abs(maxY - minY) > 5) {
+            if (!e.shiftKey && !e.ctrlKey) {
+                templateState.selectedDevices.clear();
+                templateState.connectionPoints.clear();
+            }
+            
+            devices.forEach(device => {
+                if (device.x >= minX - DEVICE_RADIUS && device.x <= maxX + DEVICE_RADIUS &&
+                    device.y >= minY - DEVICE_RADIUS && device.y <= maxY + DEVICE_RADIUS) {
+                    templateState.selectedDevices.add(device.id);
+                }
+            });
+            
+            updateSelectedLinks();
+            updateSelectionInfo();
+        }
+    }
+    
+    selectedDevice = null;
+    selectedLink = null;
+    updatePropertyPanel();
+}
+
+function updateSelectionRect() {
+    if (!templateState.selectionRect) return;
+    
+    const left = Math.min(templateState.selectStart.x, templateState.selectEnd.x);
+    const top = Math.min(templateState.selectStart.y, templateState.selectEnd.y);
+    const width = Math.abs(templateState.selectEnd.x - templateState.selectStart.x);
+    const height = Math.abs(templateState.selectEnd.y - templateState.selectStart.y);
+    
+    templateState.selectionRect.style.left = left + 'px';
+    templateState.selectionRect.style.top = top + 'px';
+    templateState.selectionRect.style.width = width + 'px';
+    templateState.selectionRect.style.height = height + 'px';
+}
+
+function updateSelectedLinks() {
+    templateState.selectedLinks.clear();
+    
+    links.forEach(link => {
+        if (templateState.selectedDevices.has(link.from) && templateState.selectedDevices.has(link.to)) {
+            templateState.selectedLinks.add(link.id);
+        }
+    });
+}
+
+function updateSelectionInfo() {
+    document.getElementById('selectedDeviceCount').textContent = templateState.selectedDevices.size;
+    document.getElementById('selectedLinkCount').textContent = templateState.selectedLinks.size;
+    
+    const markBtn = document.getElementById('markConnectionPointBtn');
+    if (templateState.selectedDevices.size === 1) {
+        const deviceId = Array.from(templateState.selectedDevices)[0];
+        if (templateState.connectionPoints.has(deviceId)) {
+            markBtn.textContent = '取消连接点';
+        } else {
+            markBtn.textContent = '标记连接点';
+        }
+        markBtn.disabled = false;
+    } else {
+        markBtn.textContent = '标记连接点';
+        markBtn.disabled = true;
+    }
+}
+
+function toggleConnectionPoint() {
+    if (templateState.selectedDevices.size !== 1) return;
+    
+    const deviceId = Array.from(templateState.selectedDevices)[0];
+    if (templateState.connectionPoints.has(deviceId)) {
+        templateState.connectionPoints.delete(deviceId);
+        addLog('已取消连接点标记', 'info');
+    } else {
+        templateState.connectionPoints.add(deviceId);
+        addLog('已标记为连接点', 'success');
+    }
+    updateSelectionInfo();
+}
+
+function openCreateTemplateModal() {
+    if (templateState.selectedDevices.size === 0) {
+        alert('请至少选择一个设备');
+        return;
+    }
+    
+    templateState.currentCreatingTemplate = {
+        devices: Array.from(templateState.selectedDevices),
+        links: Array.from(templateState.selectedLinks),
+        connectionPoints: Array.from(templateState.connectionPoints)
+    };
+    
+    document.getElementById('templateName').value = '';
+    document.getElementById('templateDescription').value = '';
+    document.getElementById('templateDeviceCount').textContent = templateState.selectedDevices.size;
+    
+    const deviceListEl = document.getElementById('templateDeviceList');
+    let deviceHtml = '';
+    templateState.selectedDevices.forEach(id => {
+        const device = devices.find(d => d.id === id);
+        if (device) {
+            const isConnectionPoint = templateState.connectionPoints.has(id);
+            deviceHtml += `<div style="padding:2px 0;">${isConnectionPoint ? '🔗 ' : ''}${escapeHtml(device.name)} (${device.type})</div>`;
+        }
+    });
+    deviceListEl.innerHTML = deviceHtml;
+    
+    document.getElementById('templateConnectionPointCount').textContent = templateState.connectionPoints.size;
+    const cpListEl = document.getElementById('templateConnectionPoints');
+    let cpHtml = '';
+    if (templateState.connectionPoints.size === 0) {
+        cpHtml = '<span style="color:#999;">无连接点（在框选模式下选中单个设备可标记）</span>';
+    } else {
+        templateState.connectionPoints.forEach(id => {
+            const device = devices.find(d => d.id === id);
+            if (device) {
+                cpHtml += `<div style="padding:2px 0;">🔗 ${escapeHtml(device.name)}</div>`;
+            }
+        });
+    }
+    cpListEl.innerHTML = cpHtml;
+    
+    const linkParamsEl = document.getElementById('templateLinkParams');
+    let linkHtml = '';
+    templateState.selectedLinks.forEach(linkId => {
+        const link = links.find(l => l.id === linkId);
+        if (link) {
+            const fromDevice = devices.find(d => d.id === link.from);
+            const toDevice = devices.find(d => d.id === link.to);
+            const linkKey = `link_${linkId}`;
+            linkHtml += `
+                <div class="template-link-param-item">
+                    <div class="template-link-param-header">
+                        <span>${fromDevice?.name || '?'} ↔ ${toDevice?.name || '?'}</span>
+                        <span style="color:#999;font-size:11px;">${link.bandwidth}Mbps / ${link.delay}ms</span>
+                    </div>
+                    <div class="template-link-param-options">
+                        <label>
+                            <input type="checkbox" name="${linkKey}_bandwidth" value="1">
+                            带宽部署时指定
+                        </label>
+                        <label>
+                            <input type="checkbox" name="${linkKey}_delay" value="1">
+                            延迟部署时指定
+                        </label>
+                    </div>
+                </div>
+            `;
+        }
+    });
+    if (linkHtml === '') {
+        linkHtml = '<div style="padding:10px;text-align:center;color:#999;font-size:11px;">无内部链路</div>';
+    }
+    linkParamsEl.innerHTML = linkHtml;
+    
+    document.getElementById('createTemplateModal').classList.add('show');
+}
+
+function closeCreateTemplateModal() {
+    document.getElementById('createTemplateModal').classList.remove('show');
+    templateState.currentCreatingTemplate = null;
+}
+
+async function confirmCreateTemplate() {
+    const name = document.getElementById('templateName').value.trim();
+    const description = document.getElementById('templateDescription').value.trim();
+    
+    if (!name) {
+        alert('请输入模板名称');
+        return;
+    }
+    
+    if (!templateState.currentCreatingTemplate) return;
+    
+    const centerX = calculateCenterX();
+    const centerY = calculateCenterY();
+    
+    const templateDevices = [];
+    templateState.currentCreatingTemplate.devices.forEach(id => {
+        const device = devices.find(d => d.id === id);
+        if (device) {
+            templateDevices.push({
+                originalId: device.id,
+                type: device.type,
+                name: device.name,
+                offsetX: device.x - centerX,
+                offsetY: device.y - centerY
+            });
+        }
+    });
+    
+    const templateLinks = [];
+    const linkParams = {};
+    templateState.currentCreatingTemplate.links.forEach(linkId => {
+        const link = links.find(l => l.id === linkId);
+        if (link) {
+            templateLinks.push({
+                originalId: link.id,
+                fromOriginalId: link.from,
+                toOriginalId: link.to,
+                bandwidth: link.bandwidth,
+                delay: link.delay,
+                reservationRatio: link.reservationRatio || 0,
+                jitter: link.jitter || 0
+            });
+            
+            const bandwidthCheckbox = document.querySelector(`input[name="link_${linkId}_bandwidth"]:checked`);
+            const delayCheckbox = document.querySelector(`input[name="link_${linkId}_delay"]:checked`);
+            
+            linkParams[linkId] = {
+                bandwidth: {
+                    required: !!bandwidthCheckbox,
+                    default: link.bandwidth
+                },
+                delay: {
+                    required: !!delayCheckbox,
+                    default: link.delay
+                }
+            };
+        }
+    });
+    
+    const thumbnail = generateTemplateThumbnail(templateDevices, templateLinks);
+    
+    const result = await apiRequest('/templates', {
+        method: 'POST',
+        body: JSON.stringify({
+            name,
+            description,
+            devices: templateDevices,
+            links: templateLinks,
+            linkParams,
+            connectionPoints: templateState.currentCreatingTemplate.connectionPoints,
+            centerX,
+            centerY,
+            thumbnail
+        })
+    });
+    
+    if (result && result.success) {
+        addLog(`模板"${name}"创建成功`, 'success');
+        closeCreateTemplateModal();
+        exitSelectMode();
+        loadTemplates();
+    } else {
+        alert('创建失败: ' + (result?.error || '未知错误'));
+    }
+}
+
+function calculateCenterX() {
+    if (templateState.selectedDevices.size === 0) return 0;
+    let sum = 0;
+    templateState.selectedDevices.forEach(id => {
+        const device = devices.find(d => d.id === id);
+        if (device) sum += device.x;
+    });
+    return sum / templateState.selectedDevices.size;
+}
+
+function calculateCenterY() {
+    if (templateState.selectedDevices.size === 0) return 0;
+    let sum = 0;
+    templateState.selectedDevices.forEach(id => {
+        const device = devices.find(d => d.id === id);
+        if (device) sum += device.y;
+    });
+    return sum / templateState.selectedDevices.size;
+}
+
+function generateTemplateThumbnail(devices, links) {
+    return null;
+}
+
+async function loadTemplates() {
+    const result = await apiRequest('/templates', { method: 'GET' });
+    if (result && result.success) {
+        templateState.templates = result.data || [];
+        renderTemplateList();
+    }
+}
+
+function renderTemplateList() {
+    const listEl = document.getElementById('templateList');
+    
+    if (templateState.templates.length === 0) {
+        listEl.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">暂无模板，使用框选模式创建</p>';
+        return;
+    }
+    
+    let html = '';
+    templateState.templates.forEach(template => {
+        const deviceCount = template.devices ? template.devices.length : 0;
+        const linkCount = template.links ? template.links.length : 0;
+        const createdAt = new Date(template.createdAt).toLocaleDateString();
+        
+        html += `
+            <div class="template-item" onclick="previewTemplate(${template.id})">
+                <div class="template-item-header">
+                    <span class="template-item-name">${escapeHtml(template.name)}</span>
+                </div>
+                <div class="template-item-info">
+                    <span>${deviceCount}设备 / ${linkCount}链路</span>
+                    <span style="color:#999;font-size:10px;">${createdAt}</span>
+                </div>
+                <div class="template-item-actions" onclick="event.stopPropagation();">
+                    <button class="btn btn-small btn-primary" onclick="deployTemplate(${template.id})">部署</button>
+                </div>
+            </div>
+        `;
+    });
+    
+    listEl.innerHTML = html;
+}
+
+window.previewTemplate = async function(templateId) {
+    const result = await apiRequest(`/templates/${templateId}`, { method: 'GET' });
+    if (!result || !result.success) {
+        alert('获取模板详情失败');
+        return;
+    }
+    
+    const template = result.data;
+    templateState.currentPreviewingTemplate = template;
+    
+    document.getElementById('previewTemplateName').value = template.name;
+    document.getElementById('previewTemplateDescription').value = template.description || '';
+    
+    let deviceHtml = '';
+    if (template.devices && template.devices.length > 0) {
+        template.devices.forEach(d => {
+            const isConnectionPoint = template.connectionPoints && template.connectionPoints.includes(d.originalId);
+            deviceHtml += `<div style="padding:2px 0;">${isConnectionPoint ? '🔗 ' : ''}${escapeHtml(d.name)} (${d.type})</div>`;
+        });
+    } else {
+        deviceHtml = '<span style="color:#999;">无设备</span>';
+    }
+    document.getElementById('previewDeviceList').innerHTML = deviceHtml;
+    
+    let linkHtml = '';
+    if (template.links && template.links.length > 0) {
+        const deviceMap = {};
+        template.devices.forEach(d => deviceMap[d.originalId] = d);
+        
+        template.links.forEach(l => {
+            const fromDev = deviceMap[l.fromOriginalId];
+            const toDev = deviceMap[l.toOriginalId];
+            const params = template.linkParams && template.linkParams[l.originalId];
+            let paramInfo = '';
+            if (params) {
+                if (params.bandwidth?.required) paramInfo += ' [带宽:部署指定]';
+                if (params.delay?.required) paramInfo += ' [延迟:部署指定]';
+            }
+            linkHtml += `<div style="padding:2px 0;">${fromDev?.name || '?'} ↔ ${toDev?.name || '?'}: ${l.bandwidth}Mbps/${l.delay}ms${paramInfo}</div>`;
+        });
+    } else {
+        linkHtml = '<span style="color:#999;">无链路</span>';
+    }
+    document.getElementById('previewLinkList').innerHTML = linkHtml;
+    
+    let cpHtml = '';
+    if (template.connectionPoints && template.connectionPoints.length > 0) {
+        const deviceMap = {};
+        template.devices.forEach(d => deviceMap[d.originalId] = d);
+        template.connectionPoints.forEach(id => {
+            const dev = deviceMap[id];
+            if (dev) {
+                cpHtml += `<div style="padding:2px 0;">🔗 ${escapeHtml(dev.name)}</div>`;
+            }
+        });
+    } else {
+        cpHtml = '<span style="color:#999;">无连接点</span>';
+    }
+    document.getElementById('previewConnectionPoints').innerHTML = cpHtml;
+    
+    document.getElementById('previewCreatedAt').textContent = new Date(template.createdAt).toLocaleString();
+    
+    document.getElementById('templatePreviewModal').classList.add('show');
+};
+
+function closePreviewTemplateModal() {
+    document.getElementById('templatePreviewModal').classList.remove('show');
+    templateState.currentPreviewingTemplate = null;
+}
+
+async function saveTemplateRename() {
+    if (!templateState.currentPreviewingTemplate) return;
+    
+    const name = document.getElementById('previewTemplateName').value.trim();
+    const description = document.getElementById('previewTemplateDescription').value.trim();
+    
+    if (!name) {
+        alert('模板名称不能为空');
+        return;
+    }
+    
+    const template = templateState.currentPreviewingTemplate;
+    
+    const result = await apiRequest(`/templates/${template.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+            name,
+            description,
+            devices: template.devices,
+            links: template.links,
+            linkParams: template.linkParams,
+            connectionPoints: template.connectionPoints,
+            centerX: template.centerX,
+            centerY: template.centerY,
+            thumbnail: template.thumbnail
+        })
+    });
+    
+    if (result && result.success) {
+        addLog('模板已更新', 'success');
+        closePreviewTemplateModal();
+        loadTemplates();
+    } else {
+        alert('更新失败: ' + (result?.error || '未知错误'));
+    }
+}
+
+async function deleteCurrentTemplate() {
+    if (!templateState.currentPreviewingTemplate) return;
+    
+    if (!confirm('确定要删除这个模板吗？')) return;
+    
+    const result = await apiRequest(`/templates/${templateState.currentPreviewingTemplate.id}`, {
+        method: 'DELETE'
+    });
+    
+    if (result && result.success) {
+        addLog('模板已删除', 'info');
+        closePreviewTemplateModal();
+        loadTemplates();
+    } else {
+        alert('删除失败: ' + (result?.error || '未知错误'));
+    }
+}
+
+window.deployTemplate = async function(templateId) {
+    if (isPlayback) {
+        addLog('回放模式下无法部署模板', 'warning');
+        return;
+    }
+    
+    const result = await apiRequest(`/templates/${templateId}`, { method: 'GET' });
+    if (!result || !result.success) {
+        alert('获取模板详情失败');
+        return;
+    }
+    
+    const template = result.data;
+    templateState.currentDeployingTemplate = template;
+    templateState.pendingDeployParams = {};
+    
+    document.getElementById('deployTemplateName').textContent = template.name;
+    document.getElementById('deployTemplateDesc').textContent = template.description || '';
+    document.getElementById('deployInstanceSuffix').value = '';
+    
+    const hasParams = template.linkParams && Object.keys(template.linkParams).some(linkId => {
+        const params = template.linkParams[linkId];
+        return params.bandwidth?.required || params.delay?.required;
+    });
+    
+    if (hasParams) {
+        document.getElementById('deployParamsSection').style.display = 'block';
+        document.getElementById('deployNoParamsSection').style.display = 'none';
+        
+        const paramsListEl = document.getElementById('deployParamsList');
+        let paramsHtml = '';
+        const deviceMap = {};
+        template.devices.forEach(d => deviceMap[d.originalId] = d);
+        
+        Object.keys(template.linkParams).forEach(linkId => {
+            const link = template.links.find(l => l.originalId == linkId);
+            const params = template.linkParams[linkId];
+            if (!link || (!params.bandwidth?.required && !params.delay?.required)) return;
+            
+            const fromDev = deviceMap[link.fromOriginalId];
+            const toDev = deviceMap[link.toOriginalId];
+            
+            paramsHtml += `
+                <div class="deploy-param-item">
+                    <div class="deploy-param-header">${fromDev?.name || '?'} ↔ ${toDev?.name || '?'}</div>
+                    <div class="deploy-param-fields">
+                        ${params.bandwidth?.required ? `
+                            <div class="deploy-param-field">
+                                <label>带宽 (Mbps)</label>
+                                <input type="number" id="deploy_bw_${linkId}" value="${params.bandwidth.default}" min="1" max="10000" placeholder="默认: ${params.bandwidth.default}">
+                            </div>
+                        ` : ''}
+                        ${params.delay?.required ? `
+                            <div class="deploy-param-field">
+                                <label>延迟 (ms)</label>
+                                <input type="number" id="deploy_delay_${linkId}" value="${params.delay.default}" min="1" max="500" placeholder="默认: ${params.delay.default}">
+                            </div>
+                        ` : ''}
+                    </div>
+                </div>
+            `;
+        });
+        
+        paramsListEl.innerHTML = paramsHtml;
+    } else {
+        document.getElementById('deployParamsSection').style.display = 'none';
+        document.getElementById('deployNoParamsSection').style.display = 'block';
+    }
+    
+    document.getElementById('deployTemplateModal').classList.add('show');
+};
+
+function closeDeployTemplateModal() {
+    document.getElementById('deployTemplateModal').classList.remove('show');
+    templateState.currentDeployingTemplate = null;
+    templateState.pendingDeployParams = {};
+}
+
+async function confirmDeployTemplate() {
+    if (!templateState.currentDeployingTemplate) return;
+    
+    const template = templateState.currentDeployingTemplate;
+    const suffix = document.getElementById('deployInstanceSuffix').value.trim();
+    
+    const deployParams = {};
+    if (template.linkParams) {
+        Object.keys(template.linkParams).forEach(linkId => {
+            const params = template.linkParams[linkId];
+            deployParams[linkId] = {
+                bandwidth: params.bandwidth?.required ? 
+                    (parseInt(document.getElementById(`deploy_bw_${linkId}`)?.value) || params.bandwidth.default) : 
+                    params.bandwidth.default,
+                delay: params.delay?.required ? 
+                    (parseInt(document.getElementById(`deploy_delay_${linkId}`)?.value) || params.delay.default) : 
+                    params.delay.default
+            };
+        });
+    }
+    
+    const canvasCenterX = canvas.width / 2 / scale - offset.x / scale;
+    const canvasCenterY = canvas.height / 2 / scale - offset.y / scale;
+    
+    const idMapping = {};
+    const createdDeviceIds = [];
+    const createdLinkIds = [];
+    const connectionPointNewIds = [];
+    
+    if (devices.length + template.devices.length > MAX_DEVICES) {
+        alert(`设备数量将超过上限（${devices.length + template.devices.length}/${MAX_DEVICES}）`);
+        return;
+    }
+    
+    template.devices.forEach((templateDevice, index) => {
+        const baseName = templateDevice.name;
+        let newName = `${baseName}-${index + 1}`;
+        if (suffix) {
+            newName += suffix;
+        }
+        
+        const newDevice = {
+            id: deviceIdCounter++,
+            type: templateDevice.type,
+            name: newName,
+            x: canvasCenterX + templateDevice.offsetX,
+            y: canvasCenterY + templateDevice.offsetY,
+            isConnectionPoint: template.connectionPoints && template.connectionPoints.includes(templateDevice.originalId)
+        };
+        
+        devices.push(newDevice);
+        idMapping[templateDevice.originalId] = newDevice.id;
+        createdDeviceIds.push(newDevice.id);
+        
+        if (newDevice.isConnectionPoint) {
+            connectionPointNewIds.push(newDevice.id);
+        }
+    });
+    
+    template.links.forEach(templateLink => {
+        const newFromId = idMapping[templateLink.fromOriginalId];
+        const newToId = idMapping[templateLink.toOriginalId];
+        const params = deployParams[templateLink.originalId] || {};
+        
+        const bandwidth = params.bandwidth !== undefined ? params.bandwidth : templateLink.bandwidth;
+        const delay = params.delay !== undefined ? params.delay : templateLink.delay;
+        
+        if (newFromId && newToId) {
+            const newLink = addLink(
+                newFromId,
+                newToId,
+                bandwidth,
+                delay,
+                templateLink.reservationRatio || 0,
+                templateLink.jitter || 0
+            );
+            if (newLink) {
+                createdLinkIds.push(newLink.id);
+            }
+        }
+    });
+    
+    const historyResult = await apiRequest('/deployment-history', {
+        method: 'POST',
+        body: JSON.stringify({
+            templateId: template.id,
+            templateName: template.name,
+            deviceIds: createdDeviceIds,
+            linkIds: createdLinkIds,
+            connectionPointDeviceIds: connectionPointNewIds
+        })
+    });
+    
+    if (connectionPointNewIds.length > 0) {
+        showConnectionPointHint(connectionPointNewIds.length);
+    }
+    
+    updateDeviceCount();
+    updateDeviceSelects();
+    recalculateRoutes();
+    triggerPartitionRecalculation(null, 'deploy_template');
+    
+    addLog(`模板"${template.name}"部署成功，创建${createdDeviceIds.length}个设备，${createdLinkIds.length}条链路`, 'success');
+    
+    closeDeployTemplateModal();
+    loadDeploymentHistory();
+}
+
+function showConnectionPointHint(count) {
+    const hintEl = document.getElementById('connectionPointHint');
+    document.getElementById('connectionPointHintText').textContent = 
+        `模板已部署，有 ${count} 个连接点设备需要与现有拓扑连接`;
+    hintEl.style.display = 'block';
+    
+    setTimeout(() => {
+        hintEl.style.display = 'none';
+    }, 8000);
+}
+
+async function loadDeploymentHistory() {
+    const result = await apiRequest('/deployment-history?limit=50', { method: 'GET' });
+    if (result && result.success) {
+        templateState.deploymentHistory = result.data || [];
+        renderDeploymentHistory();
+    }
+}
+
+function renderDeploymentHistory() {
+    const listEl = document.getElementById('deploymentHistoryList');
+    
+    if (templateState.deploymentHistory.length === 0) {
+        listEl.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:10px 0;">暂无部署记录</p>';
+        return;
+    }
+    
+    let html = '';
+    templateState.deploymentHistory.forEach(record => {
+        const time = new Date(record.timestamp).toLocaleString();
+        const deviceCount = record.deviceIds ? record.deviceIds.length : 0;
+        const linkCount = record.linkIds ? record.linkIds.length : 0;
+        
+        html += `
+            <div class="deployment-history-item">
+                <div class="deployment-history-header">
+                    <span class="deployment-history-name">${escapeHtml(record.templateName)}</span>
+                    <span class="deployment-history-time">${time}</span>
+                </div>
+                <div class="deployment-history-info">
+                    <span>${deviceCount}设备 / ${linkCount}链路</span>
+                </div>
+                <div class="deployment-history-actions">
+                    <button class="btn btn-small btn-danger" onclick="undoDeployment(${record.id})">撤销部署</button>
+                </div>
+            </div>
+        `;
+    });
+    
+    listEl.innerHTML = html;
+}
+
+window.undoDeployment = async function(recordId) {
+    if (isPlayback) {
+        addLog('回放模式下无法撤销部署', 'warning');
+        return;
+    }
+    
+    if (!confirm('确定要撤销这次部署吗？这将删除所有相关设备和链路。')) return;
+    
+    const record = templateState.deploymentHistory.find(r => r.id === recordId);
+    if (!record) {
+        alert('找不到部署记录');
+        return;
+    }
+    
+    const deviceIds = record.deviceIds || [];
+    const linkIds = record.linkIds || [];
+    const connectionPointIds = record.connectionPointDeviceIds || [];
+    
+    const allRelatedLinkIds = new Set(linkIds);
+    links.forEach(link => {
+        const fromIsCp = connectionPointIds.includes(link.from);
+        const toIsCp = connectionPointIds.includes(link.to);
+        const fromIsDeployed = deviceIds.includes(link.from);
+        const toIsDeployed = deviceIds.includes(link.to);
+        
+        if ((fromIsCp && !toIsDeployed) || (toIsCp && !fromIsDeployed)) {
+            allRelatedLinkIds.add(link.id);
+        }
+    });
+    
+    deviceIds.forEach(deviceId => {
+        const idx = devices.findIndex(d => d.id === deviceId);
+        if (idx !== -1) {
+            devices.splice(idx, 1);
+        }
+    });
+    
+    allRelatedLinkIds.forEach(linkId => {
+        const idx = links.findIndex(l => l.id === linkId);
+        if (idx !== -1) {
+            links.splice(idx, 1);
+        }
+    });
+    
+    const deleteResult = await apiRequest(`/deployment-history/${recordId}`, {
+        method: 'DELETE'
+    });
+    
+    if (deleteResult && deleteResult.success) {
+        addLog(`部署已撤销，删除${deviceIds.length}个设备，${allRelatedLinkIds.size}条链路`, 'info');
+        
+        selectedDevice = null;
+        selectedLink = null;
+        updateDeviceCount();
+        updateDeviceSelects();
+        updatePropertyPanel();
+        recalculateRoutes();
+        updateTrafficList();
+        updateFaultStats();
+        calculatePartitions();
+        updatePartitionPanel();
+        
+        loadDeploymentHistory();
+    } else {
+        alert('撤销失败: ' + (deleteResult?.error || '未知错误'));
+    }
+};
+
+const templateOriginalDrawDevice = drawDevice;
+drawDevice = function(device) {
+    const isTemplateSelected = templateState.isSelectMode && templateState.selectedDevices.has(device.id);
+    const isConnectionPoint = device.isConnectionPoint && !hasAnyConnection(device.id);
+    
+    if (isTemplateSelected || isConnectionPoint) {
+        ctx.save();
+        ctx.translate(device.x, device.y);
+        
+        if (isTemplateSelected) {
+            ctx.beginPath();
+            ctx.arc(0, 0, DEVICE_RADIUS + 8, 0, Math.PI * 2);
+            ctx.strokeStyle = '#1890ff';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([5, 5]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+        
+        if (isConnectionPoint) {
+            const flash = Math.sin(Date.now() / 300) > 0;
+            ctx.beginPath();
+            ctx.arc(0, 0, DEVICE_RADIUS + 6, 0, Math.PI * 2);
+            ctx.strokeStyle = flash ? '#fa8c16' : '#ffc069';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 4]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+        
+        ctx.restore();
+    }
+    
+    const isConnectionPointSelected = templateState.connectionPoints.has(device.id);
+    if (isConnectionPointSelected) {
+        ctx.save();
+        ctx.translate(device.x, device.y);
+        ctx.beginPath();
+        ctx.arc(0, 0, DEVICE_RADIUS + 6, 0, Math.PI * 2);
+        ctx.strokeStyle = '#fa8c16';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+    }
+    
+    templateOriginalDrawDevice(device);
+};
+
+function hasAnyConnection(deviceId) {
+    return links.some(link => {
+        const fromInTemplate = isDeviceFromTemplate(link.from);
+        const toInTemplate = isDeviceFromTemplate(link.to);
+        const bothInTemplate = fromInTemplate && toInTemplate;
+        return (link.from === deviceId || link.to === deviceId) && !bothInTemplate;
+    });
+}
+
+function isDeviceFromTemplate(deviceId) {
+    return templateState.deploymentHistory.some(record => 
+        record.deviceIds && record.deviceIds.includes(deviceId)
+    );
+}
+
+const originalDrawLinkTemplate = drawLink;
+drawLink = function(link) {
+    const isSelected = templateState.isSelectMode && templateState.selectedLinks.has(link.id);
+    
+    if (isSelected) {
+        const from = devices.find(d => d.id === link.from);
+        const to = devices.find(d => d.id === link.to);
+        if (from && to) {
+            ctx.save();
+            ctx.strokeStyle = '#1890ff';
+            ctx.lineWidth = 6;
+            ctx.lineCap = 'round';
+            ctx.globalAlpha = 0.3;
+            ctx.beginPath();
+            ctx.moveTo(from.x, from.y);
+            ctx.lineTo(to.x, to.y);
+            ctx.stroke();
+            ctx.restore();
+        }
+    }
+    
+    originalDrawLinkTemplate(link);
+};
+
+window.deployTemplate = deployTemplate;
+window.previewTemplate = previewTemplate;
+window.undoDeployment = undoDeployment;
+
+setupTemplateEvents();
+loadTemplates();
+loadDeploymentHistory();

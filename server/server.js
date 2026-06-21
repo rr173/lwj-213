@@ -47,7 +47,15 @@ const {
   getCapacitySimulation,
   saveChangeImpactHistory,
   listChangeImpactHistory,
-  getChangeImpactHistory
+  getChangeImpactHistory,
+  saveTemplate,
+  listTemplates,
+  getTemplate,
+  deleteTemplate,
+  saveDeploymentHistory,
+  listDeploymentHistory,
+  getDeploymentHistory,
+  deleteDeploymentHistory
 } = require('./database');
 
 const app = express();
@@ -927,6 +935,208 @@ app.get('/api/change-impact-history/:id', async (req, res) => {
   } catch (err) {
     console.error('获取变更历史详情失败:', err);
     res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.post('/api/templates', async (req, res) => {
+  try {
+    const { name, description, devices, links, linkParams, connectionPoints, centerX, centerY, thumbnail } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: '模板名称不能为空' });
+    }
+    if (!devices || devices.length === 0) {
+      return res.status(400).json({ error: '模板至少需要包含一个设备' });
+    }
+
+    const result = await saveTemplate({
+      name: name.trim(),
+      description: description || '',
+      devices: devices || [],
+      links: links || [],
+      linkParams: linkParams || {},
+      connectionPoints: connectionPoints || [],
+      centerX: centerX || 0,
+      centerY: centerY || 0,
+      thumbnail: thumbnail || null
+    });
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存模板失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/templates', async (req, res) => {
+  try {
+    const templates = await listTemplates();
+    res.json({
+      success: true,
+      data: templates
+    });
+  } catch (err) {
+    console.error('获取模板列表失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.get('/api/templates/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的模板ID' });
+    }
+
+    const template = await getTemplate(id);
+    if (!template) {
+      return res.status(404).json({ error: '模板不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: template
+    });
+  } catch (err) {
+    console.error('获取模板详情失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.put('/api/templates/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的模板ID' });
+    }
+
+    const { name, description, devices, links, linkParams, connectionPoints, centerX, centerY, thumbnail } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: '模板名称不能为空' });
+    }
+
+    const result = await saveTemplate({
+      id,
+      name: name.trim(),
+      description: description || '',
+      devices: devices || [],
+      links: links || [],
+      linkParams: linkParams || {},
+      connectionPoints: connectionPoints || [],
+      centerX: centerX || 0,
+      centerY: centerY || 0,
+      thumbnail: thumbnail || null
+    });
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('更新模板失败:', err);
+    res.status(500).json({ error: '更新失败' });
+  }
+});
+
+app.delete('/api/templates/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的模板ID' });
+    }
+
+    const result = await deleteTemplate(id);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('删除模板失败:', err);
+    res.status(500).json({ error: '删除失败' });
+  }
+});
+
+app.post('/api/deployment-history', async (req, res) => {
+  try {
+    const { templateId, templateName, deviceIds, linkIds, connectionPointDeviceIds } = req.body;
+
+    if (!templateName || !deviceIds) {
+      return res.status(400).json({ error: '缺少必要字段: templateName, deviceIds' });
+    }
+
+    const result = await saveDeploymentHistory({
+      templateId: templateId || null,
+      templateName,
+      deviceIds: deviceIds || [],
+      linkIds: linkIds || [],
+      connectionPointDeviceIds: connectionPointDeviceIds || []
+    });
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('保存部署历史失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/deployment-history', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const history = await listDeploymentHistory(limit);
+    res.json({
+      success: true,
+      data: history
+    });
+  } catch (err) {
+    console.error('获取部署历史失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.get('/api/deployment-history/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的部署记录ID' });
+    }
+
+    const record = await getDeploymentHistory(id);
+    if (!record) {
+      return res.status(404).json({ error: '部署记录不存在' });
+    }
+
+    res.json({
+      success: true,
+      data: record
+    });
+  } catch (err) {
+    console.error('获取部署历史详情失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.delete('/api/deployment-history/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的部署记录ID' });
+    }
+
+    const result = await deleteDeploymentHistory(id);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (err) {
+    console.error('删除部署历史失败:', err);
+    res.status(500).json({ error: '删除失败' });
   }
 });
 

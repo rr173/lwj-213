@@ -310,6 +310,45 @@ function initDatabase() {
       db.run(`
         CREATE INDEX IF NOT EXISTS idx_change_impact_history_timestamp 
         ON change_impact_history(timestamp DESC)
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS topology_templates (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          description TEXT,
+          devices TEXT NOT NULL,
+          links TEXT NOT NULL,
+          link_params TEXT NOT NULL,
+          connection_points TEXT NOT NULL,
+          center_x REAL NOT NULL,
+          center_y REAL NOT NULL,
+          thumbnail TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_topology_templates_created 
+        ON topology_templates(created_at DESC)
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS deployment_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          template_id INTEGER,
+          template_name TEXT NOT NULL,
+          device_ids TEXT NOT NULL,
+          link_ids TEXT NOT NULL,
+          connection_point_device_ids TEXT NOT NULL,
+          timestamp INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_deployment_history_timestamp 
+        ON deployment_history(timestamp DESC)
       `, (err) => {
         if (err) reject(err);
         else resolve();
@@ -1863,6 +1902,244 @@ function getResilienceReport(reportId) {
   });
 }
 
+const MAX_TOPOLOGY_TEMPLATES = 10;
+
+function saveTemplate(templateData) {
+  return new Promise((resolve, reject) => {
+    const { id, name, description, devices, links, linkParams, connectionPoints, centerX, centerY, thumbnail } = templateData;
+    const now = Date.now();
+
+    if (id) {
+      const stmt = db.prepare(`
+        UPDATE topology_templates 
+        SET name = ?, description = ?, devices = ?, links = ?, link_params = ?, 
+            connection_points = ?, center_x = ?, center_y = ?, thumbnail = ?, updated_at = ?
+        WHERE id = ?
+      `);
+      stmt.run(
+        name,
+        description || null,
+        JSON.stringify(devices || []),
+        JSON.stringify(links || []),
+        JSON.stringify(linkParams || {}),
+        JSON.stringify(connectionPoints || []),
+        centerX,
+        centerY,
+        thumbnail || null,
+        now,
+        id,
+        function(err) {
+          if (err) return reject(err);
+          resolve({
+            id,
+            name,
+            description,
+            updatedAt: now
+          });
+        }
+      );
+    } else {
+      db.get('SELECT COUNT(*) as count FROM topology_templates', (err, countRow) => {
+        if (err) return reject(err);
+
+        const currentCount = countRow.count;
+
+        const deleteOldIfNeeded = () => {
+          return new Promise((res, rej) => {
+            if (currentCount >= MAX_TOPOLOGY_TEMPLATES) {
+              const toDelete = currentCount - MAX_TOPOLOGY_TEMPLATES + 1;
+              db.run(`
+                DELETE FROM topology_templates 
+                WHERE id IN (
+                  SELECT id FROM topology_templates 
+                  ORDER BY created_at ASC 
+                  LIMIT ?
+                )
+              `, [toDelete], (err) => {
+                if (err) rej(err);
+                else res();
+              });
+            } else {
+              res();
+            }
+          });
+        };
+
+        deleteOldIfNeeded()
+          .then(() => {
+            const stmt = db.prepare(`
+              INSERT INTO topology_templates 
+                (name, description, devices, links, link_params, connection_points, 
+                 center_x, center_y, thumbnail, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `);
+            stmt.run(
+              name,
+              description || null,
+              JSON.stringify(devices || []),
+              JSON.stringify(links || []),
+              JSON.stringify(linkParams || {}),
+              JSON.stringify(connectionPoints || []),
+              centerX,
+              centerY,
+              thumbnail || null,
+              now,
+              now,
+              function(err) {
+                if (err) return reject(err);
+                resolve({
+                  id: this.lastID,
+                  name,
+                  description,
+                  createdAt: now,
+                  updatedAt: now
+                });
+              }
+            );
+          })
+          .catch(reject);
+      });
+    }
+  });
+}
+
+function listTemplates() {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT id, name, description, center_x, center_y, thumbnail, created_at, updated_at
+      FROM topology_templates 
+      ORDER BY created_at DESC
+    `, (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        name: row.name,
+        description: row.description,
+        centerX: row.center_x,
+        centerY: row.center_y,
+        thumbnail: row.thumbnail,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      })));
+    });
+  });
+}
+
+function getTemplate(templateId) {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT * FROM topology_templates WHERE id = ?`, [templateId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+
+      resolve({
+        id: row.id,
+        name: row.name,
+        description: row.description,
+        devices: JSON.parse(row.devices),
+        links: JSON.parse(row.links),
+        linkParams: JSON.parse(row.link_params),
+        connectionPoints: JSON.parse(row.connection_points),
+        centerX: row.center_x,
+        centerY: row.center_y,
+        thumbnail: row.thumbnail,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      });
+    });
+  });
+}
+
+function deleteTemplate(templateId) {
+  return new Promise((resolve, reject) => {
+    db.run('DELETE FROM topology_templates WHERE id = ?', [templateId], function(err) {
+      if (err) return reject(err);
+      resolve({ deleted: this.changes });
+    });
+  });
+}
+
+function saveDeploymentHistory(deploymentData) {
+  return new Promise((resolve, reject) => {
+    const { templateId, templateName, deviceIds, linkIds, connectionPointDeviceIds } = deploymentData;
+    const now = Date.now();
+
+    const stmt = db.prepare(`
+      INSERT INTO deployment_history 
+        (template_id, template_name, device_ids, link_ids, connection_point_device_ids, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      templateId || null,
+      templateName,
+      JSON.stringify(deviceIds || []),
+      JSON.stringify(linkIds || []),
+      JSON.stringify(connectionPointDeviceIds || []),
+      now,
+      function(err) {
+        if (err) return reject(err);
+        resolve({
+          id: this.lastID,
+          templateId,
+          templateName,
+          deviceIds,
+          linkIds,
+          connectionPointDeviceIds,
+          timestamp: now
+        });
+      }
+    );
+  });
+}
+
+function listDeploymentHistory(limit) {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT * FROM deployment_history 
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `, [limit || 50], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        templateId: row.template_id,
+        templateName: row.template_name,
+        deviceIds: JSON.parse(row.device_ids),
+        linkIds: JSON.parse(row.link_ids),
+        connectionPointDeviceIds: JSON.parse(row.connection_point_device_ids),
+        timestamp: row.timestamp
+      })));
+    });
+  });
+}
+
+function getDeploymentHistory(deploymentId) {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT * FROM deployment_history WHERE id = ?`, [deploymentId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+
+      resolve({
+        id: row.id,
+        templateId: row.template_id,
+        templateName: row.template_name,
+        deviceIds: JSON.parse(row.device_ids),
+        linkIds: JSON.parse(row.link_ids),
+        connectionPointDeviceIds: JSON.parse(row.connection_point_device_ids),
+        timestamp: row.timestamp
+      });
+    });
+  });
+}
+
+function deleteDeploymentHistory(deploymentId) {
+  return new Promise((resolve, reject) => {
+    db.run('DELETE FROM deployment_history WHERE id = ?', [deploymentId], function(err) {
+      if (err) return reject(err);
+      resolve({ deleted: this.changes });
+    });
+  });
+}
+
 const MAX_CAPACITY_SIMULATIONS = 50;
 
 function saveCapacitySimulation(simData) {
@@ -2072,5 +2349,13 @@ module.exports = {
   getCapacitySimulation,
   saveChangeImpactHistory,
   listChangeImpactHistory,
-  getChangeImpactHistory
+  getChangeImpactHistory,
+  saveTemplate,
+  listTemplates,
+  getTemplate,
+  deleteTemplate,
+  saveDeploymentHistory,
+  listDeploymentHistory,
+  getDeploymentHistory,
+  deleteDeploymentHistory
 };
