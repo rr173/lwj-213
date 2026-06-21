@@ -11494,12 +11494,23 @@ async function confirmDeployTemplate() {
         return;
     }
     
+    function getUniqueDeviceName(baseName, userSuffix) {
+        let counter = 1;
+        let candidate;
+        const usedNames = new Set(devices.map(d => d.name));
+        do {
+            candidate = `${baseName}-${counter}`;
+            if (userSuffix) {
+                candidate += userSuffix;
+            }
+            counter++;
+        } while (usedNames.has(candidate));
+        return candidate;
+    }
+    
     template.devices.forEach((templateDevice, index) => {
         const baseName = templateDevice.name;
-        let newName = `${baseName}-${index + 1}`;
-        if (suffix) {
-            newName += suffix;
-        }
+        const newName = getUniqueDeviceName(baseName, suffix);
         
         const newDevice = {
             id: deviceIdCounter++,
@@ -11628,48 +11639,48 @@ window.undoDeployment = async function(recordId) {
     
     if (!confirm('确定要撤销这次部署吗？这将删除所有相关设备和链路。')) return;
     
-    const record = templateState.deploymentHistory.find(r => r.id === recordId);
+    const numericRecordId = Number(recordId);
+    const record = templateState.deploymentHistory.find(r => Number(r.id) === numericRecordId);
     if (!record) {
         alert('找不到部署记录');
         return;
     }
     
-    const deviceIds = record.deviceIds || [];
-    const linkIds = record.linkIds || [];
-    const connectionPointIds = record.connectionPointDeviceIds || [];
+    const deviceIds = (record.deviceIds || []).map(id => Number(id));
+    const linkIds = (record.linkIds || []).map(id => Number(id));
+    const connectionPointIds = (record.connectionPointDeviceIds || []).map(id => Number(id));
+    
+    const deviceIdSet = new Set(deviceIds);
+    const cpIdSet = new Set(connectionPointIds);
     
     const allRelatedLinkIds = new Set(linkIds);
     links.forEach(link => {
-        const fromIsCp = connectionPointIds.includes(link.from);
-        const toIsCp = connectionPointIds.includes(link.to);
-        const fromIsDeployed = deviceIds.includes(link.from);
-        const toIsDeployed = deviceIds.includes(link.to);
+        const fromIsCp = cpIdSet.has(Number(link.from));
+        const toIsCp = cpIdSet.has(Number(link.to));
+        const fromIsDeployed = deviceIdSet.has(Number(link.from));
+        const toIsDeployed = deviceIdSet.has(Number(link.to));
         
-        if ((fromIsCp && !toIsDeployed) || (toIsCp && !fromIsDeployed)) {
-            allRelatedLinkIds.add(link.id);
+        if (fromIsDeployed || toIsDeployed ||
+            (fromIsCp && !toIsDeployed) || (toIsCp && !fromIsDeployed)) {
+            allRelatedLinkIds.add(Number(link.id));
         }
     });
     
-    deviceIds.forEach(deviceId => {
-        const idx = devices.findIndex(d => d.id === deviceId);
-        if (idx !== -1) {
-            devices.splice(idx, 1);
-        }
-    });
+    const newDevices = devices.filter(d => !deviceIdSet.has(Number(d.id)));
+    const removedDeviceCount = devices.length - newDevices.length;
+    devices.splice(0, devices.length, ...newDevices);
     
-    allRelatedLinkIds.forEach(linkId => {
-        const idx = links.findIndex(l => l.id === linkId);
-        if (idx !== -1) {
-            links.splice(idx, 1);
-        }
-    });
+    const allRelatedLinkIdSet = new Set([...allRelatedLinkIds].map(id => Number(id)));
+    const newLinks = links.filter(l => !allRelatedLinkIdSet.has(Number(l.id)));
+    const removedLinkCount = links.length - newLinks.length;
+    links.splice(0, links.length, ...newLinks);
     
-    const deleteResult = await apiRequest(`/deployment-history/${recordId}`, {
+    const deleteResult = await apiRequest(`/deployment-history/${numericRecordId}`, {
         method: 'DELETE'
     });
     
     if (deleteResult && deleteResult.success) {
-        addLog(`部署已撤销，删除${deviceIds.length}个设备，${allRelatedLinkIds.size}条链路`, 'info');
+        addLog(`部署已撤销，删除${removedDeviceCount}个设备，${removedLinkCount}条链路`, 'info');
         
         selectedDevice = null;
         selectedLink = null;
