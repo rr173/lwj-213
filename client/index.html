@@ -280,6 +280,28 @@
                 </div>
             </div>
 
+            <h3>抖动与路由稳定性</h3>
+            <div class="jitter-stats-panel">
+                <div class="prop-row switch-row">
+                    <span class="prop-label">震荡抑制</span>
+                    <div class="switch on" id="oscillationSuppressionSwitch">
+                        <div class="switch-handle"></div>
+                    </div>
+                </div>
+                <div class="fault-stat-row">
+                    <span class="fault-stat-label">路由切换(1分钟)</span>
+                    <span class="fault-stat-value" id="jitterRouteSwitchCount">0</span>
+                </div>
+                <div class="fault-stat-row">
+                    <span class="fault-stat-label">震荡抑制触发</span>
+                    <span class="fault-stat-value" id="jitterSuppressionCount">0</span>
+                </div>
+                <div class="jitter-section-title">链路抖动统计(最近30秒)</div>
+                <div id="jitterLinkStats" class="jitter-link-stats">
+                    <p class="hint" style="font-size:11px;color:#999;text-align:center;padding:8px 0;">暂无可抖动链路</p>
+                </div>
+            </div>
+
             <h3>路由表</h3>
             <div class="routing-panel">
                 <div class="form-group">
@@ -657,6 +679,11 @@
                 <label>带宽预留比例: <span id="linkReserveLabel">0%</span></label>
                 <input type="range" id="linkReservation" min="0" max="80" value="0" step="5" style="width:100%;">
                 <div class="qos-hint">预留带宽仅供优先流量使用，普通流量不可借用</div>
+            </div>
+            <div class="form-group">
+                <label>延迟抖动幅度: <span id="linkJitterLabel">0%</span></label>
+                <input type="range" id="linkJitter" min="0" max="100" value="0" step="1" style="width:100%;">
+                <div class="qos-hint">表示延迟波动幅度占基准延迟的百分比，0%表示不抖动</div>
             </div>
             <div class="modal-buttons">
                 <button id="cancelLinkConfig" class="btn">取消</button>

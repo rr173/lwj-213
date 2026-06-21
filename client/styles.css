@@ -4789,3 +4789,101 @@ body {
     margin-top: 8px;
 }
 
+.jitter-stats-panel {
+    font-size: 13px;
+}
+
+.jitter-section-title {
+    font-size: 12px;
+    color: #666;
+    font-weight: 500;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid #eee;
+    margin-bottom: 8px;
+}
+
+.jitter-link-stats {
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.jitter-link-item {
+    padding: 8px 10px;
+    background: #f5f7fa;
+    border-radius: 4px;
+    margin-bottom: 6px;
+    border-left: 3px solid #1890ff;
+}
+
+.jitter-link-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+    font-size: 12px;
+}
+
+.jitter-link-name {
+    font-weight: 500;
+    color: #333;
+}
+
+.jitter-link-params {
+    font-size: 11px;
+    color: #999;
+}
+
+.jitter-stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 8px;
+    font-size: 11px;
+}
+
+.jitter-stat-row {
+    display: flex;
+    justify-content: space-between;
+}
+
+.jitter-stat-label {
+    color: #999;
+}
+
+.jitter-stat-value {
+    color: #333;
+    font-family: monospace;
+}
+
+.routing-row.locked {
+    background: #fff7e6;
+    border-left: 3px solid #fa8c16;
+}
+
+.routing-row .lock-icon {
+    color: #fa8c16;
+    margin-right: 4px;
+    font-size: 11px;
+}
+
+.routing-row .lock-countdown {
+    color: #fa8c16;
+    font-size: 10px;
+    margin-left: 4px;
+}
+
+.jitter-active-indicator {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #1890ff;
+    margin-right: 4px;
+    animation: jitterPulse 1s ease-in-out infinite;
+}
+
+@keyframes jitterPulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.2); }
+}
+

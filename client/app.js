@@ -15,6 +15,23 @@ let faultStats = {
     pausedFlowCount: 0
 };
 
+let oscillationSuppressionEnabled = true;
+let jitterSamplingTimer = null;
+let dynamicRoutingTimer = null;
+
+let routeSwitchHistory = [];
+let routeLockMap = new Map();
+let routeSuppressionTriggerCount = 0;
+const ROUTE_SWITCH_WINDOW_MS = 10000;
+const ROUTE_SWITCH_THRESHOLD = 3;
+const ROUTE_LOCK_DURATION_MS = 5000;
+
+let routingTable = [];
+let linkDelayHistory = new Map();
+const LINK_DELAY_HISTORY_WINDOW_MS = 30000;
+let globalRouteSwitchCountWindow = [];
+const GLOBAL_ROUTE_SWITCH_WINDOW_MS = 60000;
+
 let batchFaultMode = false;
 let batchFaultChanged = false;
 
@@ -524,7 +541,7 @@ function hasLinkBetween(fromId, toId) {
     );
 }
 
-function addLink(fromId, toId, bandwidth, delay, reservationRatio) {
+function addLink(fromId, toId, bandwidth, delay, reservationRatio, jitter) {
     if (isPlayback) {
         addLog('回放模式下无法修改拓扑', 'warning');
         return null;
@@ -535,11 +552,17 @@ function addLink(fromId, toId, bandwidth, delay, reservationRatio) {
         to: toId,
         bandwidth: bandwidth,
         delay: delay,
+        currentDelay: delay,
         reservationRatio: reservationRatio || 0,
+        jitter: jitter !== undefined ? jitter : 0,
         enabled: true
     };
+
+    linkDelayHistory.set(link.id, []);
     
     links.push(link);
+    ensureJitterSamplingRunning();
+    ensureDynamicRoutingRunning();
     recalculateRoutes();
     triggerPartitionRecalculation(link.id, 'add_link');
     
@@ -557,6 +580,7 @@ function deleteLink(linkId) {
     }
     
     links = links.filter(l => l.id !== linkId);
+    linkDelayHistory.delete(linkId);
     
     if (selectedLink && selectedLink.id === linkId) {
         selectedLink = null;
@@ -565,6 +589,7 @@ function deleteLink(linkId) {
     
     recalculateRoutes();
     updateFaultStats();
+    checkAndStopTimers();
     triggerPartitionRecalculation(linkId, 'delete_link');
 }
 
@@ -932,29 +957,59 @@ function getNeighbors(deviceId) {
     const neighbors = [];
     links.forEach(link => {
         if (!link.enabled) return;
+        const effectiveDelay = link.currentDelay !== undefined ? link.currentDelay : link.delay;
         if (link.from === deviceId) {
-            neighbors.push({ nodeId: link.to, delay: link.delay });
+            neighbors.push({ nodeId: link.to, delay: effectiveDelay });
         } else if (link.to === deviceId) {
-            neighbors.push({ nodeId: link.from, delay: link.delay });
+            neighbors.push({ nodeId: link.from, delay: effectiveDelay });
         }
     });
     return neighbors;
 }
 
+function buildPathResult(_srcId, pathNodes) {
+    if (!pathNodes || pathNodes.length === 0) return null;
+    const segments = [];
+    let totalDelay = 0;
+    for (let i = 0; i < pathNodes.length - 1; i++) {
+        const link = findLink(pathNodes[i], pathNodes[i + 1]);
+        if (link && link.enabled) {
+            segments.push({
+                from: pathNodes[i],
+                to: pathNodes[i + 1],
+                link: link
+            });
+            totalDelay += link.currentDelay !== undefined ? link.currentDelay : link.delay;
+        } else {
+            return null;
+        }
+    }
+    return {
+        nodes: pathNodes,
+        segments: segments,
+        totalDelay: totalDelay,
+        isManual: false
+    };
+}
+
 function getPath(srcId, dstId, ignoreManual = false) {
     if (!ignoreManual) {
+        const lockInfo = getRouteLockInfo(srcId, dstId);
+        if (lockInfo && lockInfo.lockedPath) {
+            return buildPathResult(srcId, lockInfo.lockedPath);
+        }
         const manualRoute = manualRoutes.find(r => r.src === srcId && r.dst === dstId);
         if (manualRoute) {
             return getPathWithNextHop(srcId, dstId, manualRoute.nextHop);
         }
     }
-    
+
     const { dist, prev } = dijkstra(srcId);
-    
+
     if (dist[dstId] === Infinity) {
         return null;
     }
-    
+
     const path = [];
     let current = dstId;
     while (current !== srcId && current !== null) {
@@ -962,7 +1017,7 @@ function getPath(srcId, dstId, ignoreManual = false) {
         current = prev[current];
     }
     path.unshift(srcId);
-    
+
     const segments = [];
     for (let i = 0; i < path.length - 1; i++) {
         const link = findLink(path[i], path[i + 1]);
@@ -974,7 +1029,7 @@ function getPath(srcId, dstId, ignoreManual = false) {
             });
         }
     }
-    
+
     return {
         nodes: path,
         segments: segments,
@@ -1021,10 +1076,11 @@ function getPathWithNextHop(srcId, dstId, nextHopId) {
         }
     }
     
+    const firstHopDelay = link.currentDelay !== undefined ? link.currentDelay : link.delay;
     return {
         nodes: path,
         segments: segments,
-        totalDelay: link.delay + dist[dstId],
+        totalDelay: firstHopDelay + dist[dstId],
         isManual: true
     };
 }
@@ -1584,16 +1640,17 @@ function drawLink(link) {
     const midY = (from.y + to.y) / 2;
     
     const reservationRatio = link.reservationRatio || 0;
+    const displayDelay = link.currentDelay !== undefined ? link.currentDelay : link.delay;
     let label;
     if (isDisabled) {
         label = '已禁用';
     } else if (reservationRatio > 0) {
         const reservedLoad = getReservedPoolLoad(link.id);
         const bestEffortLoad = getBestEffortPoolLoad(link.id);
-        label = `${link.bandwidth}Mbps R:${(reservedLoad * 100).toFixed(0)}% B:${(bestEffortLoad * 100).toFixed(0)}%`;
+        label = `${link.bandwidth}Mbps/${displayDelay.toFixed(1)}ms R:${(reservedLoad * 100).toFixed(0)}% B:${(bestEffortLoad * 100).toFixed(0)}%`;
     } else {
         const loadRatio = getLinkLoad(link.id);
-        label = `${link.bandwidth}Mbps/${link.delay}ms ${(loadRatio * 100).toFixed(0)}%`;
+        label = `${link.bandwidth}Mbps/${displayDelay.toFixed(1)}ms ${(loadRatio * 100).toFixed(0)}%`;
     }
     
     ctx.fillStyle = '#fff';
@@ -1768,6 +1825,10 @@ function setupModalEvents() {
     document.getElementById('linkReservation').addEventListener('input', (e) => {
         document.getElementById('linkReserveLabel').textContent = e.target.value + '%';
     });
+
+    document.getElementById('linkJitter').addEventListener('input', (e) => {
+        document.getElementById('linkJitterLabel').textContent = e.target.value + '%';
+    });
     
     modal.addEventListener('click', (e) => {
         if (e.target === modal) {
@@ -1784,6 +1845,8 @@ function showLinkConfigModal(fromDevice, toDevice) {
     document.getElementById('linkDelay').value = 10;
     document.getElementById('linkReservation').value = 0;
     document.getElementById('linkReserveLabel').textContent = '0%';
+    document.getElementById('linkJitter').value = 0;
+    document.getElementById('linkJitterLabel').textContent = '0%';
     document.getElementById('linkConfigModal').classList.add('show');
 }
 
@@ -1793,6 +1856,7 @@ function confirmLinkConfig() {
     const bandwidth = parseInt(document.getElementById('linkBandwidth').value);
     const delay = parseInt(document.getElementById('linkDelay').value);
     const reservationRatio = parseInt(document.getElementById('linkReservation').value);
+    const jitter = parseInt(document.getElementById('linkJitter').value);
     
     if (bandwidth < 1 || bandwidth > 10000) {
         alert('带宽范围: 1-10000 Mbps');
@@ -1804,10 +1868,314 @@ function confirmLinkConfig() {
         return;
     }
     
-    addLink(pendingLinkConfig.from.id, pendingLinkConfig.to.id, bandwidth, delay, reservationRatio);
+    if (jitter < 0 || jitter > 100) {
+        alert('抖动范围: 0-100 %');
+        return;
+    }
+    
+    addLink(pendingLinkConfig.from.id, pendingLinkConfig.to.id, bandwidth, delay, reservationRatio, jitter);
     
     document.getElementById('linkConfigModal').classList.remove('show');
     pendingLinkConfig = null;
+}
+
+function hasAnyJitterLink() {
+    return links.some(l => l.jitter > 0);
+}
+
+function sampleJitter() {
+    const now = Date.now();
+    links.forEach(link => {
+        if (link.jitter > 0 && link.enabled) {
+            const jitterRatio = link.jitter / 100;
+            const randomFactor = 1 + (Math.random() * 2 - 1) * jitterRatio;
+            link.currentDelay = Math.max(0.1, link.delay * randomFactor);
+
+            const history = linkDelayHistory.get(link.id);
+            if (history) {
+                history.push({ time: now, value: link.currentDelay });
+                const cutoff = now - LINK_DELAY_HISTORY_WINDOW_MS;
+                while (history.length > 0 && history[0].time < cutoff) {
+                    history.shift();
+                }
+            }
+        } else if (link.currentDelay === undefined) {
+            link.currentDelay = link.delay;
+        }
+    });
+    draw();
+    updateSelectedLinkPropertyDelay();
+    updateJitterStatsPanel();
+}
+
+function updateSelectedLinkPropertyDelay() {
+    if (selectedLink) {
+        const el = document.getElementById('propCurrentDelay');
+        if (el) {
+            el.textContent = (selectedLink.currentDelay !== undefined ? selectedLink.currentDelay : selectedLink.delay).toFixed(1);
+        }
+    }
+}
+
+function ensureJitterSamplingRunning() {
+    if (!hasAnyJitterLink()) return;
+    if (jitterSamplingTimer !== null) return;
+    jitterSamplingTimer = setInterval(sampleJitter, 1000);
+}
+
+function ensureDynamicRoutingRunning() {
+    if (!hasAnyJitterLink()) return;
+    if (dynamicRoutingTimer !== null) return;
+    dynamicRoutingTimer = setInterval(dynamicRouteRecalculation, 1000);
+}
+
+function checkAndStopTimers() {
+    if (!hasAnyJitterLink()) {
+        if (jitterSamplingTimer !== null) {
+            clearInterval(jitterSamplingTimer);
+            jitterSamplingTimer = null;
+        }
+        if (dynamicRoutingTimer !== null) {
+            clearInterval(dynamicRoutingTimer);
+            dynamicRoutingTimer = null;
+        }
+    }
+}
+
+function getRouteKey(srcId, dstId) {
+    return `${srcId}-${dstId}`;
+}
+
+function isRouteLocked(srcId, dstId) {
+    if (!oscillationSuppressionEnabled) return false;
+    const key = getRouteKey(srcId, dstId);
+    const lockInfo = routeLockMap.get(key);
+    if (!lockInfo) return false;
+    if (Date.now() >= lockInfo.unlockTime) {
+        routeLockMap.delete(key);
+        return false;
+    }
+    return true;
+}
+
+function getRouteLockInfo(srcId, dstId) {
+    const key = getRouteKey(srcId, dstId);
+    const lockInfo = routeLockMap.get(key);
+    if (!lockInfo) return null;
+    if (Date.now() >= lockInfo.unlockTime) {
+        routeLockMap.delete(key);
+        return null;
+    }
+    return lockInfo;
+}
+
+function recordRouteSwitch(srcId, dstId) {
+    const now = Date.now();
+    const key = getRouteKey(srcId, dstId);
+
+    let history = routeSwitchHistory.filter(h => h.key === key);
+    history = history.filter(h => now - h.time <= ROUTE_SWITCH_WINDOW_MS);
+    history.push({ time: now, key });
+
+    routeSwitchHistory = routeSwitchHistory.filter(h => now - h.time <= ROUTE_SWITCH_WINDOW_MS);
+    routeSwitchHistory = routeSwitchHistory.filter(h => h.key !== key);
+    routeSwitchHistory.push(...history);
+
+    globalRouteSwitchCountWindow.push({ time: now });
+    globalRouteSwitchCountWindow = globalRouteSwitchCountWindow.filter(h => now - h.time <= GLOBAL_ROUTE_SWITCH_WINDOW_MS);
+
+    if (oscillationSuppressionEnabled && history.length > ROUTE_SWITCH_THRESHOLD && !routeLockMap.has(key)) {
+        const curPath = getPath(srcId, dstId, true);
+        routeLockMap.set(key, {
+            unlockTime: now + ROUTE_LOCK_DURATION_MS,
+            lockedPath: curPath ? curPath.nodes : null
+        });
+        routeSuppressionTriggerCount++;
+        addLog(`路由震荡抑制: ${srcId}->${dstId} 锁定5秒`, 'warning');
+    }
+}
+
+function pathEquals(p1, p2) {
+    if (!p1 || !p2) return p1 === p2;
+    if (p1.length !== p2.length) return false;
+    for (let i = 0; i < p1.length; i++) {
+        if (p1[i] !== p2[i]) return false;
+    }
+    return true;
+}
+
+function calculatePathDelayFromNodes(pathNodes) {
+    let total = 0;
+    for (let i = 0; i < pathNodes.length - 1; i++) {
+        const a = pathNodes[i], b = pathNodes[i + 1];
+        const link = links.find(l => l.enabled &&
+            ((l.from === a && l.to === b) || (l.from === b && l.to === a)));
+        if (link) {
+            total += link.currentDelay !== undefined ? link.currentDelay : link.delay;
+        } else {
+            return Infinity;
+        }
+    }
+    return total;
+}
+
+function dynamicRouteRecalculation() {
+    devices.forEach(src => {
+        devices.forEach(dst => {
+            if (src.id === dst.id) return;
+            const key = getRouteKey(src.id, dst.id);
+
+            const locked = isRouteLocked(src.id, dst.id);
+            let newPathNodes = null;
+            if (locked) {
+                const lockInfo = routeLockMap.get(key);
+                if (lockInfo && lockInfo.lockedPath) {
+                    newPathNodes = lockInfo.lockedPath;
+                }
+            }
+            if (!newPathNodes) {
+                const computed = getPath(src.id, dst.id, true);
+                newPathNodes = computed ? computed.nodes : null;
+            }
+
+            const oldEntry = routingTable.find(r => r.src === src.id && r.dst === dst.id);
+            const oldPathNodes = oldEntry ? oldEntry.path : null;
+
+            if (!pathEquals(oldPathNodes, newPathNodes) && !locked) {
+                recordRouteSwitch(src.id, dst.id);
+                if (isRouteLocked(src.id, dst.id)) {
+                    const lockInfo = routeLockMap.get(key);
+                    if (lockInfo && lockInfo.lockedPath) {
+                        newPathNodes = lockInfo.lockedPath;
+                    }
+                }
+            }
+
+            if (oldEntry) {
+                oldEntry.path = newPathNodes;
+                oldEntry.delay = newPathNodes ? calculatePathDelayFromNodes(newPathNodes) : Infinity;
+            } else {
+                routingTable.push({
+                    src: src.id,
+                    dst: dst.id,
+                    path: newPathNodes,
+                    delay: newPathNodes ? calculatePathDelayFromNodes(newPathNodes) : Infinity
+                });
+            }
+        });
+    });
+
+    trafficFlows.forEach(flow => {
+        if (flow.completed) return;
+        if (!flow.path || !flow.path.nodes) return;
+
+        if (isRouteLocked(flow.srcId, flow.dstId)) {
+            const lockInfo = getRouteLockInfo(flow.srcId, flow.dstId);
+            if (lockInfo && lockInfo.lockedPath) {
+                if (!pathEquals(flow.path.nodes, lockInfo.lockedPath)) {
+                    const lockedPathResult = buildPathResult(flow.srcId, lockInfo.lockedPath);
+                    if (lockedPathResult) {
+                        flow.path = lockedPathResult;
+                    }
+                }
+                return;
+            }
+        }
+
+        const newPathResult = getPath(flow.srcId, flow.dstId, true);
+        if (!newPathResult) return;
+        if (!pathEquals(flow.path.nodes, newPathResult.nodes)) {
+            flow.path = newPathResult;
+        }
+    });
+
+    updateRoutingTableDisplay();
+    updateJitterStatsPanel();
+}
+
+function setupOscillationSuppressionEvents() {
+    const sw = document.getElementById('oscillationSuppressionSwitch');
+    if (!sw) return;
+    sw.addEventListener('click', () => {
+        oscillationSuppressionEnabled = !oscillationSuppressionEnabled;
+        sw.classList.toggle('on', oscillationSuppressionEnabled);
+        sw.classList.toggle('off', !oscillationSuppressionEnabled);
+        if (!oscillationSuppressionEnabled) {
+            routeLockMap.clear();
+        }
+        updateRoutingTableDisplay();
+    });
+}
+
+function computeStats(values) {
+    if (!values || values.length === 0) {
+        return { min: 0, max: 0, avg: 0, stddev: 0, count: 0 };
+    }
+    let sum = 0, min = Infinity, max = -Infinity;
+    values.forEach(v => {
+        sum += v;
+        if (v < min) min = v;
+        if (v > max) max = v;
+    });
+    const avg = sum / values.length;
+    let varianceSum = 0;
+    values.forEach(v => {
+        varianceSum += (v - avg) * (v - avg);
+    });
+    const stddev = Math.sqrt(varianceSum / values.length);
+    return { min, max, avg, stddev, count: values.length };
+}
+
+function updateJitterStatsPanel() {
+    const routeSwitchEl = document.getElementById('jitterRouteSwitchCount');
+    if (routeSwitchEl) {
+        const now = Date.now();
+        globalRouteSwitchCountWindow = globalRouteSwitchCountWindow.filter(h => now - h.time <= GLOBAL_ROUTE_SWITCH_WINDOW_MS);
+        routeSwitchEl.textContent = globalRouteSwitchCountWindow.length;
+    }
+    const suppressionEl = document.getElementById('jitterSuppressionCount');
+    if (suppressionEl) {
+        suppressionEl.textContent = routeSuppressionTriggerCount;
+    }
+
+    const container = document.getElementById('jitterLinkStats');
+    if (!container) return;
+
+    const jitterLinks = links.filter(l => l.jitter > 0);
+    if (jitterLinks.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:11px;color:#999;text-align:center;padding:8px 0;">暂无可抖动链路</p>';
+        return;
+    }
+
+    let html = '';
+    jitterLinks.forEach(link => {
+        const fromDev = devices.find(d => d.id === link.from);
+        const toDev = devices.find(d => d.id === link.to);
+        const history = linkDelayHistory.get(link.id) || [];
+        const values = history.map(h => h.value);
+        const stats = computeStats(values);
+        const currentDelay = link.currentDelay !== undefined ? link.currentDelay : link.delay;
+
+        html += `
+        <div class="jitter-link-item">
+            <div class="jitter-link-header">
+                <span class="jitter-link-name">
+                    <span class="jitter-active-indicator"></span>
+                    ${fromDev ? fromDev.name : link.from} ↔ ${toDev ? toDev.name : link.to}
+                </span>
+                <span class="jitter-link-params">基准${link.delay}ms · 抖动${link.jitter}%</span>
+            </div>
+            <div class="jitter-stats-grid">
+                <div class="jitter-stat-row"><span class="jitter-stat-label">当前</span><span class="jitter-stat-value">${currentDelay.toFixed(2)}ms</span></div>
+                <div class="jitter-stat-row"><span class="jitter-stat-label">样本</span><span class="jitter-stat-value">${stats.count}</span></div>
+                <div class="jitter-stat-row"><span class="jitter-stat-label">最小</span><span class="jitter-stat-value">${stats.count ? stats.min.toFixed(2) : '-'}ms</span></div>
+                <div class="jitter-stat-row"><span class="jitter-stat-label">最大</span><span class="jitter-stat-value">${stats.count ? stats.max.toFixed(2) : '-'}ms</span></div>
+                <div class="jitter-stat-row"><span class="jitter-stat-label">平均</span><span class="jitter-stat-value">${stats.count ? stats.avg.toFixed(2) : '-'}ms</span></div>
+                <div class="jitter-stat-row"><span class="jitter-stat-label">标准差</span><span class="jitter-stat-value">${stats.count ? stats.stddev.toFixed(2) : '-'}ms</span></div>
+            </div>
+        </div>`;
+    });
+    container.innerHTML = html;
 }
 
 function setupContextMenu() {
@@ -1939,8 +2307,19 @@ function updatePropertyPanel() {
                 <input type="number" id="propBandwidth" value="${selectedLink.bandwidth}" class="prop-input" min="1" max="10000" ${isEnabled ? '' : 'disabled'}>
             </div>
             <div class="prop-row">
-                <span class="prop-label">延迟 (ms)</span>
+                <span class="prop-label">基准延迟 (ms)</span>
                 <input type="number" id="propDelay" value="${selectedLink.delay}" class="prop-input" min="1" max="500" ${isEnabled ? '' : 'disabled'}>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">瞬时延迟 (ms)</span>
+                <span class="prop-value" id="propCurrentDelay">${(selectedLink.currentDelay !== undefined ? selectedLink.currentDelay : selectedLink.delay).toFixed(1)}</span>
+            </div>
+            <div class="prop-row">
+                <span class="prop-label">抖动幅度</span>
+                <span class="prop-value"><span id="propJitterLabel">${selectedLink.jitter || 0}%</span></span>
+            </div>
+            <div class="prop-row" style="flex-direction:column;align-items:stretch;gap:4px;">
+                <input type="range" id="propJitter" min="0" max="100" value="${selectedLink.jitter || 0}" step="1" style="width:100%;" ${isEnabled ? '' : 'disabled'}>
             </div>
             <div class="prop-row">
                 <span class="prop-label">当前负载</span>
@@ -2010,7 +2389,33 @@ function updatePropertyPanel() {
             const val = parseInt(e.target.value);
             if (val >= 1 && val <= 500) {
                 selectedLink.delay = val;
+                if (selectedLink.currentDelay === undefined || selectedLink.jitter === 0) {
+                    selectedLink.currentDelay = val;
+                }
                 recalculateRoutes();
+            }
+        });
+
+        document.getElementById('propJitter').addEventListener('input', (e) => {
+            const val = parseInt(e.target.value);
+            document.getElementById('propJitterLabel').textContent = val + '%';
+        });
+
+        document.getElementById('propJitter').addEventListener('change', (e) => {
+            const val = parseInt(e.target.value);
+            if (val >= 0 && val <= 100) {
+                selectedLink.jitter = val;
+                if (val === 0) {
+                    selectedLink.currentDelay = selectedLink.delay;
+                    const history = linkDelayHistory.get(selectedLink.id);
+                    if (history) {
+                        history.length = 0;
+                    }
+                }
+                ensureJitterSamplingRunning();
+                ensureDynamicRoutingRunning();
+                checkAndStopTimers();
+                updateJitterStatsPanel();
             }
         });
         
@@ -2045,37 +2450,46 @@ function getDeviceLinkCount(deviceId) {
 function updateRoutingTableDisplay() {
     const deviceId = parseInt(document.getElementById('routingDevice').value);
     const table = document.getElementById('routingTable');
-    
+
     if (!deviceId) {
         table.innerHTML = '<p class="hint">请选择设备</p>';
         return;
     }
-    
+
     let html = '';
-    
+    const now = Date.now();
+
     devices.forEach(dest => {
         if (dest.id === deviceId) return;
-        
+
         const path = getPath(deviceId, dest.id);
         const hasManualRoute = manualRoutes.some(r => r.src === deviceId && r.dst === dest.id);
-        
+        const lockInfo = getRouteLockInfo(deviceId, dest.id);
+        const isLocked = !!lockInfo;
+        const lockCountdown = lockInfo ? Math.ceil((lockInfo.unlockTime - now) / 1000) : 0;
+        const rowClass = [
+            'routing-row',
+            hasManualRoute ? 'manual' : '',
+            isLocked ? 'locked' : ''
+        ].filter(Boolean).join(' ');
+
         if (!path) {
-            html += `<div class="routing-row unreachable ${hasManualRoute ? 'manual' : ''}">
-                <span class="dest">${dest.name}</span>
+            html += `<div class="${rowClass} unreachable">
+                <span class="dest">${isLocked ? '<span class="lock-icon">🔒</span>' : ''}${dest.name}${isLocked ? `<span class="lock-countdown">${lockCountdown}s</span>` : ''}</span>
                 <span class="next-hop">不可达</span>
                 <span class="delay">-</span>
             </div>`;
         } else {
             const nextHopId = path.nodes[1];
             const nextHopDevice = devices.find(d => d.id === nextHopId);
-            html += `<div class="routing-row ${hasManualRoute ? 'manual' : ''}">
-                <span class="dest">${dest.name}</span>
+            html += `<div class="${rowClass}">
+                <span class="dest">${isLocked ? '<span class="lock-icon">🔒</span>' : ''}${dest.name}${isLocked ? `<span class="lock-countdown">${lockCountdown}s</span>` : ''}</span>
                 <span class="next-hop">${nextHopDevice ? nextHopDevice.name : '-'}</span>
-                <span class="delay">${path.totalDelay}ms</span>
+                <span class="delay">${typeof path.totalDelay === 'number' ? path.totalDelay.toFixed(1) : path.totalDelay}ms</span>
             </div>`;
         }
     });
-    
+
     table.innerHTML = html || '<p class="hint">无其他设备</p>';
 }
 
@@ -2341,7 +2755,8 @@ function exportTopology() {
             bandwidth: l.bandwidth,
             delay: l.delay,
             enabled: l.enabled,
-            reservationRatio: l.reservationRatio || 0
+            reservationRatio: l.reservationRatio || 0,
+            jitter: l.jitter || 0
         })),
         manualRoutes: manualRoutes
     };
@@ -2375,11 +2790,15 @@ function importTopology(e) {
             }
             
             devices = data.devices.map(d => ({ ...d }));
-            links = data.links.map(l => ({ 
-                ...l, 
+            links = data.links.map(l => ({
+                ...l,
                 enabled: l.enabled !== undefined ? l.enabled : true,
-                reservationRatio: l.reservationRatio || 0
+                reservationRatio: l.reservationRatio || 0,
+                jitter: l.jitter || 0,
+                currentDelay: l.delay
             }));
+            linkDelayHistory.clear();
+            links.forEach(l => linkDelayHistory.set(l.id, []));
             manualRoutes = data.manualRoutes || [];
             
             deviceIdCounter = Math.max(...devices.map(d => d.id), 0) + 1;
@@ -2405,8 +2824,17 @@ function importTopology(e) {
             recalculateRoutes();
             updateTrafficList();
             updateFaultStats();
+            routeSwitchHistory = [];
+            routeLockMap.clear();
+            routeSuppressionTriggerCount = 0;
+            globalRouteSwitchCountWindow = [];
+            ensureJitterSamplingRunning();
+            ensureDynamicRoutingRunning();
+            checkAndStopTimers();
+            updateJitterStatsPanel();
+            updateRoutingTableDisplay();
             triggerPartitionRecalculation(null, 'import_topology');
-            
+
             addLog('拓扑导入成功', 'success');
             
         } catch (err) {
@@ -2799,11 +3227,14 @@ function scenarioSample() {
         const reservationRatio = link.reservationRatio || 0;
         const reservedPoolLoad = reservationRatio > 0 ? getReservedPoolLoad(link.id) : 0;
         const bestEffortPoolLoad = reservationRatio > 0 ? getBestEffortPoolLoad(link.id) : load;
+        const currentDelay = link.currentDelay !== undefined ? link.currentDelay : link.delay;
         scenarioLinkSamples.get(link.id).push({
             time: Math.round(sampleTime * 10) / 10,
             load: load,
             reservedPoolLoad: reservedPoolLoad,
-            bestEffortPoolLoad: bestEffortPoolLoad
+            bestEffortPoolLoad: bestEffortPoolLoad,
+            delay: currentDelay,
+            baseDelay: link.delay
         });
     });
 }
@@ -5260,11 +5691,12 @@ drawLink = function(link) {
     const midY = (from.y + to.y) / 2;
 
     const loadRatio = (playbackLinkLoads.get(link.id) || 0) * 100;
+    const displayDelay = link.currentDelay !== undefined ? link.currentDelay : link.delay;
     let label;
     if (isDisabled) {
         label = '已禁用';
     } else {
-        label = `${link.bandwidth}Mbps/${link.delay}ms ${loadRatio.toFixed(0)}%`;
+        label = `${link.bandwidth}Mbps/${displayDelay.toFixed(1)}ms ${loadRatio.toFixed(0)}%`;
     }
 
     ctx.fillStyle = '#fff';
@@ -5459,6 +5891,20 @@ function renderRecordingCompareResults() {
     tableEl.innerHTML = html;
 }
 
+function initializeLinksForJitter() {
+    links.forEach(link => {
+        if (link.currentDelay === undefined) {
+            link.currentDelay = link.delay;
+        }
+        if (link.jitter === undefined) {
+            link.jitter = 0;
+        }
+        if (!linkDelayHistory.has(link.id)) {
+            linkDelayHistory.set(link.id, []);
+        }
+    });
+}
+
 const originalInit3 = init;
 init = function() {
     originalInit3();
@@ -5466,6 +5912,11 @@ init = function() {
     setupConfigAuditEvents();
     setupTrafficRecordingEvents();
     setupSlaEvents();
+    setupOscillationSuppressionEvents();
+    initializeLinksForJitter();
+    ensureJitterSamplingRunning();
+    ensureDynamicRoutingRunning();
+    updateJitterStatsPanel();
     loadTopologyVersions();
     loadTrafficRecordings();
 
@@ -5776,7 +6227,7 @@ function calculateSlaMetrics(contract) {
 
     let latency = 0;
     path.segments.forEach(seg => {
-        latency += seg.link.delay;
+        latency += seg.link.currentDelay !== undefined ? seg.link.currentDelay : seg.link.delay;
     });
 
     let passThroughProduct = 1;
@@ -5813,9 +6264,10 @@ function evaluateSlaCompliance(contract, metrics) {
         let maxDelayLink = null;
         const breakdown = [];
         path.segments.forEach(seg => {
-            breakdown.push({ linkId: seg.link.id, delay: seg.link.delay, name: getLinkDisplayName(seg.link.id) });
-            if (seg.link.delay > maxDelay) {
-                maxDelay = seg.link.delay;
+            const segDelay = seg.link.currentDelay !== undefined ? seg.link.currentDelay : seg.link.delay;
+            breakdown.push({ linkId: seg.link.id, delay: segDelay, name: getLinkDisplayName(seg.link.id) });
+            if (segDelay > maxDelay) {
+                maxDelay = segDelay;
                 maxDelayLink = seg.link;
             }
         });
@@ -6802,7 +7254,7 @@ function calculatePathLatency(path) {
     for (let i = 0; i < path.length - 1; i++) {
         const link = findLink(path[i], path[i + 1]);
         if (link) {
-            latency += link.delay || 10;
+            latency += (link.currentDelay !== undefined ? link.currentDelay : link.delay) || 10;
         }
     }
     return latency;
@@ -8649,7 +9101,7 @@ function calculateSimulatedSlaViolations(multiplier, planOverrides) {
         }
 
         let latency = 0;
-        path.segments.forEach(seg => { latency += seg.link.delay; });
+        path.segments.forEach(seg => { latency += seg.link.currentDelay !== undefined ? seg.link.currentDelay : seg.link.delay; });
 
         let passThroughProduct = 1;
         path.segments.forEach(seg => {
@@ -9539,6 +9991,8 @@ function buildSimulatedTopology() {
                     to: op.toId,
                     bandwidth: op.bandwidth,
                     delay: op.delay,
+                    currentDelay: op.delay,
+                    jitter: op.jitter || 0,
                     enabled: true
                 });
                 break;
@@ -9589,7 +10043,8 @@ function simDijkstra(srcId, simDevices, simLinks) {
             if (link.from === minNode) neighborId = link.to;
             else if (link.to === minNode) neighborId = link.from;
             if (neighborId !== null && !visited.has(neighborId)) {
-                const alt = dist[minNode] + link.delay;
+                const linkDelay = link.currentDelay !== undefined ? link.currentDelay : link.delay;
+                const alt = dist[minNode] + linkDelay;
                 if (alt < dist[neighborId]) {
                     dist[neighborId] = alt;
                     prev[neighborId] = minNode;
@@ -9803,7 +10258,7 @@ function runCiAnalysis() {
                     simReasons.push('不可达');
                 } else {
                     let latency = 0;
-                    simPath.segments.forEach(seg => { latency += seg.link.delay; });
+                    simPath.segments.forEach(seg => { latency += seg.link.currentDelay !== undefined ? seg.link.currentDelay : seg.link.delay; });
 
                     let passThroughProduct = 1;
                     simPath.segments.forEach(seg => {
