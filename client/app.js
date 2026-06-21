@@ -9174,7 +9174,7 @@ async function saveCapacitySimulationToBackend(result) {
             recommendedBandwidth: r.recommendedBandwidth
         }));
 
-        await apiRequest('/api/capacity-simulations', {
+        await apiRequest('/capacity-simulations', {
             method: 'POST',
             body: JSON.stringify({
                 growthMultiplier: result.multiplier,
@@ -9205,7 +9205,7 @@ async function loadCapacityHistory() {
     container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">加载中...</p>';
 
     try {
-        const resp = await apiRequest('/api/capacity-simulations?limit=20');
+        const resp = await apiRequest('/capacity-simulations?limit=20');
         if (!resp || !resp.success || !resp.data || resp.data.length === 0) {
             container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">暂无历史记录</p>';
             return;
