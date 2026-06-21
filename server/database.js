@@ -289,6 +289,27 @@ function initDatabase() {
       db.run(`
         CREATE INDEX IF NOT EXISTS idx_capacity_simulations_timestamp 
         ON capacity_simulations(timestamp DESC)
+      `);
+
+      db.run(`
+        CREATE TABLE IF NOT EXISTS change_impact_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operations TEXT NOT NULL,
+          risk_level TEXT NOT NULL,
+          affected_flows TEXT NOT NULL,
+          overloaded_links TEXT NOT NULL,
+          sla_changes TEXT NOT NULL,
+          partition_change TEXT NOT NULL,
+          pre_snapshot TEXT,
+          post_snapshot TEXT,
+          applied INTEGER NOT NULL DEFAULT 0,
+          timestamp INTEGER NOT NULL
+        )
+      `);
+
+      db.run(`
+        CREATE INDEX IF NOT EXISTS idx_change_impact_history_timestamp 
+        ON change_impact_history(timestamp DESC)
       `, (err) => {
         if (err) reject(err);
         else resolve();
@@ -1936,6 +1957,76 @@ function getCapacitySimulation(simId) {
   });
 }
 
+function saveChangeImpactHistory(data) {
+  return new Promise((resolve, reject) => {
+    const stmt = db.prepare(`
+      INSERT INTO change_impact_history (
+        operations, risk_level, affected_flows, overloaded_links,
+        sla_changes, partition_change, pre_snapshot, post_snapshot,
+        applied, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      JSON.stringify(data.operations || []),
+      data.riskLevel || 'none',
+      JSON.stringify(data.affectedFlows || []),
+      JSON.stringify(data.overloadedLinks || []),
+      JSON.stringify(data.slaChanges || []),
+      JSON.stringify(data.partitionChange || {}),
+      data.preSnapshot ? JSON.stringify(data.preSnapshot) : null,
+      data.postSnapshot ? JSON.stringify(data.postSnapshot) : null,
+      data.applied ? 1 : 0,
+      data.timestamp || Date.now(),
+      function(err) {
+        if (err) return reject(err);
+        resolve({ id: this.lastID, timestamp: data.timestamp || Date.now() });
+      }
+    );
+  });
+}
+
+function listChangeImpactHistory(limit) {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT id, operations, risk_level, applied, timestamp
+      FROM change_impact_history
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `, [limit || 50], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows.map(row => ({
+        id: row.id,
+        operations: JSON.parse(row.operations),
+        riskLevel: row.risk_level,
+        applied: row.applied === 1,
+        timestamp: row.timestamp
+      })));
+    });
+  });
+}
+
+function getChangeImpactHistory(historyId) {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT * FROM change_impact_history WHERE id = ?`, [historyId], (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+      resolve({
+        id: row.id,
+        operations: JSON.parse(row.operations),
+        riskLevel: row.risk_level,
+        affectedFlows: JSON.parse(row.affected_flows),
+        overloadedLinks: JSON.parse(row.overloaded_links),
+        slaChanges: JSON.parse(row.sla_changes),
+        partitionChange: JSON.parse(row.partition_change),
+        preSnapshot: row.pre_snapshot ? JSON.parse(row.pre_snapshot) : null,
+        postSnapshot: row.post_snapshot ? JSON.parse(row.post_snapshot) : null,
+        applied: row.applied === 1,
+        timestamp: row.timestamp
+      });
+    });
+  });
+}
+
 module.exports = {
   initDatabase,
   saveTopology,
@@ -1978,5 +2069,8 @@ module.exports = {
   getResilienceReport,
   saveCapacitySimulation,
   listCapacitySimulations,
-  getCapacitySimulation
+  getCapacitySimulation,
+  saveChangeImpactHistory,
+  listChangeImpactHistory,
+  getChangeImpactHistory
 };

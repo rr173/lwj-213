@@ -137,6 +137,11 @@
                 </div>
             </div>
 
+            <h3>网络变更影响分析</h3>
+            <div class="change-impact-panel">
+                <button id="openChangeImpactModalBtn" class="btn btn-primary" style="width:100%;">打开变更影响分析</button>
+            </div>
+
             <h3>网络容量规划</h3>
             <div class="capacity-panel">
                 <button id="openCapacityModalBtn" class="btn btn-primary" style="width:100%;">打开容量规划模拟器</button>
@@ -855,6 +860,128 @@
                     <button id="refreshCapacityHistoryBtn" class="btn btn-small">刷新列表</button>
                 </div>
                 <div class="capacity-history-list" id="capacityHistoryList">
+                    <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">加载中...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="changeImpactModal" class="modal change-impact-modal">
+        <div class="modal-content change-impact-modal-content">
+            <div class="change-impact-modal-header">
+                <h3>网络变更影响分析</h3>
+                <button id="closeChangeImpactModal" class="btn-small">×</button>
+            </div>
+
+            <div class="change-impact-tabs">
+                <button class="change-impact-tab active" data-ci-tab="editor">变更清单</button>
+                <button class="change-impact-tab" data-ci-tab="history">变更历史</button>
+            </div>
+
+            <div class="change-impact-tab-content" id="ci-tab-editor">
+                <div class="ci-change-form">
+                    <div class="form-group">
+                        <label>变更操作</label>
+                        <select id="ciOperationType">
+                            <option value="delete_link">删除链路</option>
+                            <option value="modify_link_bw">修改链路带宽</option>
+                            <option value="add_link">新增链路</option>
+                            <option value="disable_device">禁用设备</option>
+                        </select>
+                    </div>
+
+                    <div id="ciDeleteLinkFields" class="ci-operation-fields">
+                        <div class="form-group">
+                            <label>选择链路</label>
+                            <select id="ciDeleteLinkSelect"></select>
+                        </div>
+                    </div>
+
+                    <div id="ciModifyBwFields" class="ci-operation-fields" style="display:none;">
+                        <div class="form-group">
+                            <label>选择链路</label>
+                            <select id="ciModifyBwLinkSelect"></select>
+                        </div>
+                        <div class="form-group">
+                            <label>新带宽 (Mbps)</label>
+                            <input type="number" id="ciNewBandwidth" value="100" min="1" max="10000">
+                        </div>
+                    </div>
+
+                    <div id="ciAddLinkFields" class="ci-operation-fields" style="display:none;">
+                        <div class="form-group">
+                            <label>端点A</label>
+                            <select id="ciAddLinkFrom"></select>
+                        </div>
+                        <div class="form-group">
+                            <label>端点B</label>
+                            <select id="ciAddLinkTo"></select>
+                        </div>
+                        <div class="form-group">
+                            <label>带宽 (Mbps)</label>
+                            <input type="number" id="ciAddLinkBw" value="100" min="1" max="10000">
+                        </div>
+                        <div class="form-group">
+                            <label>延迟 (ms)</label>
+                            <input type="number" id="ciAddLinkDelay" value="10" min="1" max="500">
+                        </div>
+                    </div>
+
+                    <div id="ciDisableDeviceFields" class="ci-operation-fields" style="display:none;">
+                        <div class="form-group">
+                            <label>选择设备</label>
+                            <select id="ciDisableDeviceSelect"></select>
+                        </div>
+                    </div>
+
+                    <button id="ciAddOperationBtn" class="btn btn-primary" style="width:100%;">添加到变更清单</button>
+                </div>
+
+                <div class="ci-change-list-section">
+                    <div class="ci-change-list-header">
+                        <span>变更清单 (<span id="ciChangeCount">0</span>项)</span>
+                        <button id="ciClearAllBtn" class="btn btn-small">清空</button>
+                    </div>
+                    <div class="ci-change-list" id="ciChangeList">
+                        <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无变更操作</p>
+                    </div>
+                </div>
+
+                <div class="ci-risk-section" id="ciRiskSection" style="display:none;">
+                    <div class="ci-risk-badge" id="ciRiskBadge">无风险</div>
+                </div>
+
+                <div class="ci-analysis-result" id="ciAnalysisResult" style="display:none;">
+                    <div class="ci-result-section">
+                        <h4>受影响流量</h4>
+                        <div id="ciAffectedFlows"></div>
+                    </div>
+                    <div class="ci-result-section">
+                        <h4>新增超载链路</h4>
+                        <div id="ciOverloadedLinks"></div>
+                    </div>
+                    <div class="ci-result-section">
+                        <h4>SLA违约变化</h4>
+                        <div id="ciSlaChanges"></div>
+                    </div>
+                    <div class="ci-result-section">
+                        <h4>分区变化</h4>
+                        <div id="ciPartitionChanges"></div>
+                    </div>
+                </div>
+
+                <div class="ci-actions">
+                    <button id="ciAnalyzeBtn" class="btn btn-primary" style="flex:1;">分析影响</button>
+                    <button id="ciApplyBtn" class="btn btn-success" style="flex:1;display:none;">应用变更</button>
+                    <button id="ciRevertBtn" class="btn btn-danger" style="flex:1;display:none;">撤销变更</button>
+                </div>
+            </div>
+
+            <div class="change-impact-tab-content" id="ci-tab-history" style="display:none;">
+                <div class="ci-history-header">
+                    <button id="ciRefreshHistoryBtn" class="btn btn-small">刷新列表</button>
+                </div>
+                <div class="ci-history-list" id="ciHistoryList">
                     <p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">加载中...</p>
                 </div>
             </div>

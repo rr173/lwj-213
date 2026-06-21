@@ -44,7 +44,10 @@ const {
   getResilienceReport,
   saveCapacitySimulation,
   listCapacitySimulations,
-  getCapacitySimulation
+  getCapacitySimulation,
+  saveChangeImpactHistory,
+  listChangeImpactHistory,
+  getChangeImpactHistory
 } = require('./database');
 
 const app = express();
@@ -881,6 +884,48 @@ app.get('/api/capacity-simulations/:id', async (req, res) => {
     });
   } catch (err) {
     console.error('获取容量模拟失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.post('/api/change-impact-history', async (req, res) => {
+  try {
+    const data = req.body;
+    if (!data.operations || !data.riskLevel) {
+      return res.status(400).json({ error: '缺少必要字段: operations, riskLevel' });
+    }
+    const result = await saveChangeImpactHistory(data);
+    res.json({ success: true, data: result });
+  } catch (err) {
+    console.error('保存变更历史失败:', err);
+    res.status(500).json({ error: '保存失败' });
+  }
+});
+
+app.get('/api/change-impact-history', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const history = await listChangeImpactHistory(limit);
+    res.json({ success: true, data: history });
+  } catch (err) {
+    console.error('获取变更历史列表失败:', err);
+    res.status(500).json({ error: '获取失败' });
+  }
+});
+
+app.get('/api/change-impact-history/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: '无效的ID' });
+    }
+    const record = await getChangeImpactHistory(id);
+    if (!record) {
+      return res.status(404).json({ error: '记录不存在' });
+    }
+    res.json({ success: true, data: record });
+  } catch (err) {
+    console.error('获取变更历史详情失败:', err);
     res.status(500).json({ error: '获取失败' });
   }
 });

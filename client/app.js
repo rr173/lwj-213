@@ -9268,3 +9268,1039 @@ function loadCapacityExpansionPlansFromStorage() {
 }
 
 initCapacityPlanningModule();
+
+let ciChangeOperations = [];
+let ciAnalysisResult = null;
+let ciIsAnalyzing = false;
+let ciPreSnapshot = null;
+let ciLastAppliedId = null;
+
+function initChangeImpactModule() {
+    document.getElementById('openChangeImpactModalBtn').addEventListener('click', openChangeImpactModal);
+    document.getElementById('closeChangeImpactModal').addEventListener('click', closeChangeImpactModal);
+
+    document.querySelectorAll('.change-impact-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            switchChangeImpactTab(tab.dataset.ciTab);
+        });
+    });
+
+    document.getElementById('ciOperationType').addEventListener('change', function() {
+        const type = this.value;
+        document.querySelectorAll('.ci-operation-fields').forEach(f => f.style.display = 'none');
+        const fieldMap = {
+            delete_link: 'ciDeleteLinkFields',
+            modify_link_bw: 'ciModifyBwFields',
+            add_link: 'ciAddLinkFields',
+            disable_device: 'ciDisableDeviceFields'
+        };
+        if (fieldMap[type]) {
+            document.getElementById(fieldMap[type]).style.display = 'block';
+        }
+    });
+
+    document.getElementById('ciAddOperationBtn').addEventListener('click', addCiOperation);
+    document.getElementById('ciClearAllBtn').addEventListener('click', clearCiOperations);
+    document.getElementById('ciAnalyzeBtn').addEventListener('click', runCiAnalysis);
+    document.getElementById('ciApplyBtn').addEventListener('click', applyCiChanges);
+    document.getElementById('ciRevertBtn').addEventListener('click', revertCiChanges);
+    document.getElementById('ciRefreshHistoryBtn').addEventListener('click', loadCiHistory);
+}
+
+function openChangeImpactModal() {
+    document.getElementById('changeImpactModal').style.display = 'block';
+    refreshCiSelects();
+    renderCiChangeList();
+    resetCiAnalysisUI();
+}
+
+function closeChangeImpactModal() {
+    document.getElementById('changeImpactModal').style.display = 'none';
+}
+
+function switchChangeImpactTab(tabName) {
+    document.querySelectorAll('.change-impact-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.ciTab === tabName);
+    });
+    document.getElementById('ci-tab-editor').style.display = tabName === 'editor' ? 'block' : 'none';
+    document.getElementById('ci-tab-history').style.display = tabName === 'history' ? 'block' : 'none';
+
+    if (tabName === 'history') {
+        loadCiHistory();
+    }
+}
+
+function refreshCiSelects() {
+    const activeLinks = links.filter(l => l.enabled);
+    const deleteSelect = document.getElementById('ciDeleteLinkSelect');
+    const modifySelect = document.getElementById('ciModifyBwLinkSelect');
+    const fromSelect = document.getElementById('ciAddLinkFrom');
+    const toSelect = document.getElementById('ciAddLinkTo');
+    const deviceSelect = document.getElementById('ciDisableDeviceSelect');
+
+    [deleteSelect, modifySelect].forEach(sel => {
+        sel.innerHTML = '';
+        activeLinks.forEach(link => {
+            const opt = document.createElement('option');
+            opt.value = link.id;
+            opt.textContent = getLinkDisplayName(link.id);
+            sel.appendChild(opt);
+        });
+    });
+
+    [fromSelect, toSelect].forEach(sel => {
+        sel.innerHTML = '';
+        devices.forEach(d => {
+            const opt = document.createElement('option');
+            opt.value = d.id;
+            opt.textContent = d.name;
+            sel.appendChild(opt);
+        });
+    });
+
+    deviceSelect.innerHTML = '';
+    devices.forEach(d => {
+        const opt = document.createElement('option');
+        opt.value = d.id;
+        opt.textContent = d.name;
+        deviceSelect.appendChild(opt);
+    });
+}
+
+function addCiOperation() {
+    if (ciIsAnalyzing) {
+        alert('正在分析中，无法修改变更清单');
+        return;
+    }
+
+    const type = document.getElementById('ciOperationType').value;
+    let operation = null;
+
+    switch (type) {
+        case 'delete_link': {
+            const linkId = parseInt(document.getElementById('ciDeleteLinkSelect').value);
+            if (!linkId) { alert('请选择链路'); return; }
+            operation = { type: 'delete_link', linkId, linkName: getLinkDisplayName(linkId) };
+            break;
+        }
+        case 'modify_link_bw': {
+            const linkId = parseInt(document.getElementById('ciModifyBwLinkSelect').value);
+            const newBw = parseFloat(document.getElementById('ciNewBandwidth').value);
+            if (!linkId) { alert('请选择链路'); return; }
+            if (isNaN(newBw) || newBw <= 0) { alert('请输入有效带宽'); return; }
+            const link = links.find(l => l.id === linkId);
+            operation = {
+                type: 'modify_link_bw',
+                linkId,
+                linkName: getLinkDisplayName(linkId),
+                oldBandwidth: link ? link.bandwidth : 0,
+                newBandwidth: newBw
+            };
+            break;
+        }
+        case 'add_link': {
+            const fromId = parseInt(document.getElementById('ciAddLinkFrom').value);
+            const toId = parseInt(document.getElementById('ciAddLinkTo').value);
+            const bw = parseFloat(document.getElementById('ciAddLinkBw').value);
+            const delay = parseFloat(document.getElementById('ciAddLinkDelay').value);
+            if (!fromId || !toId) { alert('请选择端点设备'); return; }
+            if (fromId === toId) { alert('端点不能相同'); return; }
+            if (isNaN(bw) || bw <= 0) { alert('请输入有效带宽'); return; }
+            if (isNaN(delay) || delay <= 0) { alert('请输入有效延迟'); return; }
+            operation = {
+                type: 'add_link',
+                fromId,
+                toId,
+                fromName: getDeviceName(fromId),
+                toName: getDeviceName(toId),
+                bandwidth: bw,
+                delay: delay
+            };
+            break;
+        }
+        case 'disable_device': {
+            const deviceId = parseInt(document.getElementById('ciDisableDeviceSelect').value);
+            if (!deviceId) { alert('请选择设备'); return; }
+            const deviceLinks = links.filter(l =>
+                l.enabled && (l.from === deviceId || l.to === deviceId)
+            );
+            operation = {
+                type: 'disable_device',
+                deviceId,
+                deviceName: getDeviceName(deviceId),
+                affectedLinkCount: deviceLinks.length
+            };
+            break;
+        }
+    }
+
+    if (operation) {
+        ciChangeOperations.push(operation);
+        renderCiChangeList();
+        resetCiAnalysisUI();
+    }
+}
+
+function removeCiOperation(index) {
+    if (ciIsAnalyzing) return;
+    ciChangeOperations.splice(index, 1);
+    renderCiChangeList();
+    resetCiAnalysisUI();
+}
+
+function clearCiOperations() {
+    if (ciIsAnalyzing) return;
+    ciChangeOperations = [];
+    renderCiChangeList();
+    resetCiAnalysisUI();
+}
+
+function renderCiChangeList() {
+    const container = document.getElementById('ciChangeList');
+    const countEl = document.getElementById('ciChangeCount');
+    countEl.textContent = ciChangeOperations.length;
+
+    if (ciChangeOperations.length === 0) {
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:10px 0;">暂无变更操作</p>';
+        return;
+    }
+
+    let html = '';
+    ciChangeOperations.forEach((op, idx) => {
+        let desc = '';
+        let typeLabel = '';
+        let typeClass = '';
+
+        switch (op.type) {
+            case 'delete_link':
+                desc = `删除链路 ${escapeHtml(op.linkName)}`;
+                typeLabel = '删链路';
+                typeClass = 'ci-op-delete';
+                break;
+            case 'modify_link_bw':
+                desc = `${escapeHtml(op.linkName)} 带宽 ${op.oldBandwidth}→${op.newBandwidth}Mbps`;
+                typeLabel = '改带宽';
+                typeClass = 'ci-op-modify';
+                break;
+            case 'add_link':
+                desc = `新增链路 ${escapeHtml(op.fromName)}↔${escapeHtml(op.toName)} ${op.bandwidth}Mbps ${op.delay}ms`;
+                typeLabel = '加链路';
+                typeClass = 'ci-op-add';
+                break;
+            case 'disable_device':
+                desc = `禁用设备 ${escapeHtml(op.deviceName)} (影响${op.affectedLinkCount}条链路)`;
+                typeLabel = '禁设备';
+                typeClass = 'ci-op-disable';
+                break;
+        }
+
+        html += `
+            <div class="ci-change-item ${typeClass}">
+                <span class="ci-change-item-type">${typeLabel}</span>
+                <span class="ci-change-item-desc">${desc}</span>
+                <button class="ci-change-item-remove" onclick="removeCiOperation(${idx})">×</button>
+            </div>
+        `;
+    });
+
+    container.innerHTML = html;
+}
+
+function resetCiAnalysisUI() {
+    ciAnalysisResult = null;
+    document.getElementById('ciRiskSection').style.display = 'none';
+    document.getElementById('ciAnalysisResult').style.display = 'none';
+    document.getElementById('ciApplyBtn').style.display = 'none';
+    document.getElementById('ciRevertBtn').style.display = 'none';
+}
+
+function buildSimulatedTopology() {
+    const simDevices = devices.map(d => ({ ...d }));
+    const simLinks = links.map(l => ({ ...l }));
+    const disabledDeviceIds = new Set();
+
+    ciChangeOperations.forEach(op => {
+        switch (op.type) {
+            case 'delete_link': {
+                const idx = simLinks.findIndex(l => l.id === op.linkId);
+                if (idx >= 0) simLinks[idx].enabled = false;
+                break;
+            }
+            case 'modify_link_bw': {
+                const idx = simLinks.findIndex(l => l.id === op.linkId);
+                if (idx >= 0) simLinks[idx].bandwidth = op.newBandwidth;
+                break;
+            }
+            case 'add_link': {
+                const newId = Math.max(...simLinks.map(l => l.id), 0) + 1;
+                simLinks.push({
+                    id: newId,
+                    from: op.fromId,
+                    to: op.toId,
+                    bandwidth: op.bandwidth,
+                    delay: op.delay,
+                    enabled: true
+                });
+                break;
+            }
+            case 'disable_device': {
+                disabledDeviceIds.add(op.deviceId);
+                simLinks.forEach(l => {
+                    if (l.from === op.deviceId || l.to === op.deviceId) {
+                        l.enabled = false;
+                    }
+                });
+                break;
+            }
+        }
+    });
+
+    return { simDevices, simLinks, disabledDeviceIds };
+}
+
+function simDijkstra(srcId, simDevices, simLinks) {
+    const dist = {};
+    const prev = {};
+    const visited = new Set();
+
+    simDevices.forEach(d => {
+        dist[d.id] = Infinity;
+        prev[d.id] = null;
+    });
+    dist[srcId] = 0;
+
+    while (true) {
+        let minDist = Infinity;
+        let minNode = null;
+
+        simDevices.forEach(d => {
+            if (!visited.has(d.id) && dist[d.id] < minDist) {
+                minDist = dist[d.id];
+                minNode = d.id;
+            }
+        });
+
+        if (minNode === null) break;
+        visited.add(minNode);
+
+        simLinks.forEach(link => {
+            if (!link.enabled) return;
+            let neighborId = null;
+            if (link.from === minNode) neighborId = link.to;
+            else if (link.to === minNode) neighborId = link.from;
+            if (neighborId !== null && !visited.has(neighborId)) {
+                const alt = dist[minNode] + link.delay;
+                if (alt < dist[neighborId]) {
+                    dist[neighborId] = alt;
+                    prev[neighborId] = minNode;
+                }
+            }
+        });
+    }
+
+    return { dist, prev };
+}
+
+function simGetPath(srcId, dstId, simDevices, simLinks) {
+    const { dist, prev } = simDijkstra(srcId, simDevices, simLinks);
+    if (dist[dstId] === Infinity) return null;
+
+    const path = [];
+    let current = dstId;
+    while (current !== srcId && current !== null) {
+        path.unshift(current);
+        current = prev[current];
+    }
+    path.unshift(srcId);
+
+    const segments = [];
+    for (let i = 0; i < path.length - 1; i++) {
+        const link = simLinks.find(l =>
+            l.enabled &&
+            ((l.from === path[i] && l.to === path[i + 1]) ||
+             (l.to === path[i] && l.from === path[i + 1]))
+        );
+        if (link) {
+            segments.push({
+                from: path[i],
+                to: path[i + 1],
+                link: link
+            });
+        }
+    }
+
+    return {
+        nodes: path,
+        segments: segments,
+        totalDelay: dist[dstId]
+    };
+}
+
+function simCalculatePartitions(simDevices, simLinks) {
+    const visited = new Set();
+    let count = 0;
+
+    simDevices.forEach(device => {
+        if (visited.has(device.id)) return;
+
+        const queue = [device.id];
+        visited.add(device.id);
+
+        while (queue.length > 0) {
+            const currentId = queue.shift();
+            simLinks.forEach(link => {
+                if (!link.enabled) return;
+                let neighborId = null;
+                if (link.from === currentId) neighborId = link.to;
+                else if (link.to === currentId) neighborId = link.from;
+                if (neighborId !== null && !visited.has(neighborId)) {
+                    visited.add(neighborId);
+                    queue.push(neighborId);
+                }
+            });
+        }
+
+        count++;
+    });
+
+    return count;
+}
+
+function simGetLinkLoad(linkId, simLinks) {
+    const link = simLinks.find(l => l.id === linkId);
+    if (!link || !link.enabled) return 0;
+
+    let totalRate = 0;
+    trafficFlows.forEach(flow => {
+        const simPath = simGetPath(flow.srcId, flow.dstId, devices, simLinks);
+        if (simPath && simPath.segments && simPath.segments.some(seg =>
+            (seg.from === link.from && seg.to === link.to) ||
+            (seg.from === link.to && seg.to === link.from)
+        )) {
+            totalRate += flow.actualRate || flow.rate;
+        }
+    });
+
+    return totalRate / (link.bandwidth * 1000000);
+}
+
+function runCiAnalysis() {
+    if (ciChangeOperations.length === 0) {
+        alert('请先添加变更操作');
+        return;
+    }
+
+    ciIsAnalyzing = true;
+    document.getElementById('ciAnalyzeBtn').textContent = '分析中...';
+    document.getElementById('ciAnalyzeBtn').disabled = true;
+    document.getElementById('ciAddOperationBtn').disabled = true;
+    document.getElementById('ciClearAllBtn').disabled = true;
+
+    setTimeout(() => {
+        try {
+            const { simDevices, simLinks, disabledDeviceIds } = buildSimulatedTopology();
+            const currentPartitionCount = simCalculatePartitions(devices, links);
+            const simPartitionCount = simCalculatePartitions(simDevices, simLinks);
+
+            const affectedFlows = [];
+            const affectedLinkIds = new Set();
+            ciChangeOperations.forEach(op => {
+                if (op.type === 'delete_link') affectedLinkIds.add(op.linkId);
+                if (op.type === 'disable_device') {
+                    links.filter(l => l.enabled && (l.from === op.deviceId || l.to === op.deviceId))
+                        .forEach(l => affectedLinkIds.add(l.id));
+                }
+            });
+
+            trafficFlows.forEach(flow => {
+                if (flow.completed) return;
+                const currentPath = flow.path;
+                if (!currentPath || !currentPath.segments || currentPath.segments.length === 0) return;
+
+                const usesAffectedLink = currentPath.segments.some(seg =>
+                    affectedLinkIds.has(seg.link.id)
+                );
+
+                if (usesAffectedLink) {
+                    const simPath = simGetPath(flow.srcId, flow.dstId, simDevices, simLinks);
+                    if (simPath && simPath.segments && simPath.segments.length > 0) {
+                        const currentDelay = currentPath.totalDelay;
+                        const simDelay = simPath.totalDelay;
+                        affectedFlows.push({
+                            flowId: flow.id,
+                            srcName: getDeviceName(flow.srcId),
+                            dstName: getDeviceName(flow.dstId),
+                            status: 'rerouted',
+                            oldDelay: currentDelay,
+                            newDelay: simDelay,
+                            delayIncrease: simDelay - currentDelay
+                        });
+                    } else {
+                        affectedFlows.push({
+                            flowId: flow.id,
+                            srcName: getDeviceName(flow.srcId),
+                            dstName: getDeviceName(flow.dstId),
+                            status: 'disconnected',
+                            oldDelay: currentPath.totalDelay,
+                            newDelay: null,
+                            delayIncrease: null
+                        });
+                    }
+                }
+            });
+
+            const overloadedLinks = [];
+            simLinks.forEach(link => {
+                if (!link.enabled) return;
+                let totalRate = 0;
+                trafficFlows.forEach(flow => {
+                    if (flow.completed) return;
+                    const simPath = simGetPath(flow.srcId, flow.dstId, simDevices, simLinks);
+                    if (simPath && simPath.segments && simPath.segments.some(seg =>
+                        (seg.from === link.from && seg.to === link.to) ||
+                        (seg.from === link.to && seg.to === link.from)
+                    )) {
+                        totalRate += flow.actualRate || flow.rate;
+                    }
+                });
+
+                const loadRate = totalRate / (link.bandwidth * 1000000);
+                const currentLoadRate = (() => {
+                    const origLink = links.find(l => l.id === link.id);
+                    if (origLink) return getLinkLoad(origLink.id);
+                    return 0;
+                })();
+
+                if (loadRate > 1.0 && currentLoadRate <= 1.0) {
+                    overloadedLinks.push({
+                        linkId: link.id,
+                        linkName: (() => {
+                            const fromDev = devices.find(d => d.id === link.from);
+                            const toDev = devices.find(d => d.id === link.to);
+                            const fromName = fromDev ? fromDev.name : '?';
+                            const toName = toDev ? toDev.name : '?';
+                            return fromName + ' ↔ ' + toName;
+                        })(),
+                        newLoadRate: loadRate,
+                        oldLoadRate: currentLoadRate,
+                        bandwidth: link.bandwidth
+                    });
+                }
+            });
+
+            const slaChanges = { newViolations: [], recovered: [] };
+            slaContracts.forEach(contract => {
+                if (!contract.monitoring) return;
+
+                const currentViolating = contract.isViolating;
+
+                const simPath = simGetPath(contract.srcDeviceId, contract.dstDeviceId, simDevices, simLinks);
+                let simViolating = false;
+                let simReasons = [];
+
+                if (!simPath || !simPath.segments || simPath.segments.length === 0) {
+                    simViolating = true;
+                    simReasons.push('不可达');
+                } else {
+                    let latency = 0;
+                    simPath.segments.forEach(seg => { latency += seg.link.delay; });
+
+                    let passThroughProduct = 1;
+                    simPath.segments.forEach(seg => {
+                        const origLink = links.find(l => l.id === seg.link.id);
+                        const congestionState = origLink ? congestionStates.get(origLink.id) : null;
+                        if (congestionState && congestionState.packetLossActive) {
+                            passThroughProduct *= (1 - 0.2);
+                        }
+                    });
+                    const lossRate = (1 - passThroughProduct) * 100;
+
+                    let availableBandwidth = Infinity;
+                    simPath.segments.forEach(seg => {
+                        const link = seg.link;
+                        const currentLoad = simGetLinkLoad(link.id, simLinks);
+                        const usedBw = currentLoad * link.bandwidth;
+                        const remaining = link.bandwidth - usedBw;
+                        if (remaining < availableBandwidth) {
+                            availableBandwidth = remaining;
+                        }
+                    });
+
+                    if (latency > contract.maxLatency) {
+                        simViolating = true;
+                        simReasons.push('延迟');
+                    }
+                    if (lossRate > contract.maxLossRate) {
+                        simViolating = true;
+                        simReasons.push('丢包');
+                    }
+                    if (availableBandwidth < contract.minBandwidth) {
+                        simViolating = true;
+                        simReasons.push('带宽');
+                    }
+                }
+
+                if (!currentViolating && simViolating) {
+                    slaChanges.newViolations.push({
+                        name: contract.name,
+                        reasons: simReasons
+                    });
+                } else if (currentViolating && !simViolating) {
+                    slaChanges.recovered.push({
+                        name: contract.name
+                    });
+                }
+            });
+
+            const partitionChange = {
+                oldCount: currentPartitionCount,
+                newCount: simPartitionCount,
+                increased: simPartitionCount > currentPartitionCount
+            };
+
+            const disconnectedCount = affectedFlows.filter(f => f.status === 'disconnected').length;
+            const reroutedCount = affectedFlows.filter(f => f.status === 'rerouted').length;
+            const newViolationCount = slaChanges.newViolations.length;
+
+            let riskLevel;
+            if (disconnectedCount > 0 || partitionChange.increased) {
+                riskLevel = 'high';
+            } else if (newViolationCount > 0) {
+                riskLevel = 'medium';
+            } else if (reroutedCount > 0) {
+                riskLevel = 'low';
+            } else {
+                riskLevel = 'none';
+            }
+
+            ciAnalysisResult = {
+                affectedFlows,
+                overloadedLinks,
+                slaChanges,
+                partitionChange,
+                riskLevel,
+                disconnectedCount,
+                reroutedCount,
+                newViolationCount
+            };
+
+            renderCiAnalysisResult();
+
+        } catch (err) {
+            console.error('变更影响分析失败:', err);
+            alert('分析失败: ' + err.message);
+        } finally {
+            ciIsAnalyzing = false;
+            document.getElementById('ciAnalyzeBtn').textContent = '分析影响';
+            document.getElementById('ciAnalyzeBtn').disabled = false;
+            document.getElementById('ciAddOperationBtn').disabled = false;
+            document.getElementById('ciClearAllBtn').disabled = false;
+        }
+    }, 100);
+}
+
+function renderCiAnalysisResult() {
+    if (!ciAnalysisResult) return;
+
+    const riskSection = document.getElementById('ciRiskSection');
+    const riskBadge = document.getElementById('ciRiskBadge');
+    riskSection.style.display = 'block';
+
+    const riskConfig = {
+        none: { label: '无风险', className: 'risk-none' },
+        low: { label: '低风险', className: 'risk-low' },
+        medium: { label: '中风险', className: 'risk-medium' },
+        high: { label: '高风险', className: 'risk-high' }
+    };
+    const rc = riskConfig[ciAnalysisResult.riskLevel];
+    riskBadge.textContent = rc.label;
+    riskBadge.className = 'ci-risk-badge ' + rc.className;
+
+    const resultSection = document.getElementById('ciAnalysisResult');
+    resultSection.style.display = 'block';
+
+    const flowsEl = document.getElementById('ciAffectedFlows');
+    if (ciAnalysisResult.affectedFlows.length === 0) {
+        flowsEl.innerHTML = '<p class="hint" style="font-size:12px;color:#999;">无受影响流量</p>';
+    } else {
+        let html = '';
+        const disconnected = ciAnalysisResult.affectedFlows.filter(f => f.status === 'disconnected');
+        const rerouted = ciAnalysisResult.affectedFlows.filter(f => f.status === 'rerouted');
+
+        if (disconnected.length > 0) {
+            html += '<div class="ci-flow-group ci-flow-disconnected"><div class="ci-flow-group-title">断开流量 (' + disconnected.length + ')</div>';
+            disconnected.forEach(f => {
+                html += `<div class="ci-flow-item">流量${f.flowId} ${escapeHtml(f.srcName)}→${escapeHtml(f.dstName)} <span class="ci-flow-status ci-status-disconnected">断开</span></div>`;
+            });
+            html += '</div>';
+        }
+
+        if (rerouted.length > 0) {
+            html += '<div class="ci-flow-group ci-flow-rerouted"><div class="ci-flow-group-title">重路由流量 (' + rerouted.length + ')</div>';
+            rerouted.forEach(f => {
+                const delayDelta = f.delayIncrease > 0 ? ` (+${f.delayIncrease}ms)` : '';
+                html += `<div class="ci-flow-item">流量${f.flowId} ${escapeHtml(f.srcName)}→${escapeHtml(f.dstName)} <span class="ci-flow-status ci-status-rerouted">重路由${delayDelta}</span></div>`;
+            });
+            html += '</div>';
+        }
+
+        flowsEl.innerHTML = html;
+    }
+
+    const overloadedEl = document.getElementById('ciOverloadedLinks');
+    if (ciAnalysisResult.overloadedLinks.length === 0) {
+        overloadedEl.innerHTML = '<p class="hint" style="font-size:12px;color:#999;">无新增超载链路</p>';
+    } else {
+        let html = '<div class="ci-overload-list">';
+        ciAnalysisResult.overloadedLinks.forEach(l => {
+            html += `<div class="ci-overload-item">
+                <span class="ci-overload-name">${escapeHtml(l.linkName)}</span>
+                <span class="ci-overload-rate">${(l.oldLoadRate * 100).toFixed(1)}% → ${(l.newLoadRate * 100).toFixed(1)}%</span>
+                <span class="ci-overload-bw">${l.bandwidth}Mbps</span>
+            </div>`;
+        });
+        html += '</div>';
+        overloadedEl.innerHTML = html;
+    }
+
+    const slaEl = document.getElementById('ciSlaChanges');
+    if (ciAnalysisResult.slaChanges.newViolations.length === 0 && ciAnalysisResult.slaChanges.recovered.length === 0) {
+        slaEl.innerHTML = '<p class="hint" style="font-size:12px;color:#999;">无SLA变化</p>';
+    } else {
+        let html = '';
+        if (ciAnalysisResult.slaChanges.newViolations.length > 0) {
+            html += '<div class="ci-sla-group ci-sla-new-violation"><div class="ci-sla-group-title">新增违约 (' + ciAnalysisResult.slaChanges.newViolations.length + ')</div>';
+            ciAnalysisResult.slaChanges.newViolations.forEach(v => {
+                html += `<div class="ci-sla-item">${escapeHtml(v.name)} <span class="ci-sla-reason">${v.reasons.join(', ')}</span></div>`;
+            });
+            html += '</div>';
+        }
+        if (ciAnalysisResult.slaChanges.recovered.length > 0) {
+            html += '<div class="ci-sla-group ci-sla-recovered"><div class="ci-sla-group-title">恢复达标 (' + ciAnalysisResult.slaChanges.recovered.length + ')</div>';
+            ciAnalysisResult.slaChanges.recovered.forEach(v => {
+                html += `<div class="ci-sla-item">${escapeHtml(v.name)}</div>`;
+            });
+            html += '</div>';
+        }
+        slaEl.innerHTML = html;
+    }
+
+    const partitionEl = document.getElementById('ciPartitionChanges');
+    const pc = ciAnalysisResult.partitionChange;
+    if (pc.oldCount === pc.newCount) {
+        partitionEl.innerHTML = '<p class="hint" style="font-size:12px;color:#999;">分区数不变 (' + pc.oldCount + ')</p>';
+    } else {
+        const cls = pc.increased ? 'ci-partition-worse' : 'ci-partition-better';
+        partitionEl.innerHTML = `<div class="ci-partition-change ${cls}">分区数: ${pc.oldCount} → ${pc.newCount} ${pc.increased ? '⚠️ 增加' : '✓ 减少'}</div>`;
+    }
+
+    document.getElementById('ciApplyBtn').style.display = 'inline-block';
+}
+
+function takeTopologySnapshot() {
+    return {
+        devices: JSON.parse(JSON.stringify(devices)),
+        links: JSON.parse(JSON.stringify(links)),
+        trafficFlows: JSON.parse(JSON.stringify(trafficFlows.map(f => ({
+            id: f.id, srcId: f.srcId, dstId: f.dstId, rate: f.rate,
+            actualRate: f.actualRate, priority: f.priority, paused: f.paused,
+            pauseReason: f.pauseReason, completed: f.completed, path: f.path
+        })))),
+        slaContracts: JSON.parse(JSON.stringify(slaContracts)),
+        deviceIdCounter,
+        linkIdCounter
+    };
+}
+
+function restoreTopologySnapshot(snapshot) {
+    devices.length = 0;
+    snapshot.devices.forEach(d => devices.push(d));
+    links.length = 0;
+    snapshot.links.forEach(l => links.push(l));
+    trafficFlows.length = 0;
+    snapshot.trafficFlows.forEach(f => trafficFlows.push(f));
+    slaContracts.length = 0;
+    snapshot.slaContracts.forEach(c => slaContracts.push(c));
+    deviceIdCounter = snapshot.deviceIdCounter;
+    linkIdCounter = snapshot.linkIdCounter;
+
+    recalculateRoutes();
+    rerouteAffectedFlows();
+    calculatePartitions();
+    updateTrafficList();
+    updateLinkCongestion();
+    updatePropertyPanel();
+}
+
+async function applyCiChanges() {
+    if (!ciAnalysisResult) return;
+
+    const riskLevel = ciAnalysisResult.riskLevel;
+
+    if (riskLevel === 'high') {
+        const msg = `此变更为高风险！将会断开 ${ciAnalysisResult.disconnectedCount} 条流量` +
+            (ciAnalysisResult.partitionChange.increased ? '，且分区数将增加' : '') +
+            '。确认应用？';
+        if (!confirm(msg)) return;
+        if (!confirm('二次确认：确定要应用高风险变更吗？')) return;
+    } else if (riskLevel === 'medium') {
+        const msg = `此变更为中风险，将新增 ${ciAnalysisResult.newViolationCount} 个SLA违约。确认应用？`;
+        if (!confirm(msg)) return;
+    }
+
+    ciPreSnapshot = takeTopologySnapshot();
+
+    ciChangeOperations.forEach(op => {
+        switch (op.type) {
+            case 'delete_link': {
+                const link = links.find(l => l.id === op.linkId);
+                if (link) link.enabled = false;
+                break;
+            }
+            case 'modify_link_bw': {
+                const link = links.find(l => l.id === op.linkId);
+                if (link) link.bandwidth = op.newBandwidth;
+                break;
+            }
+            case 'add_link': {
+                const newId = linkIdCounter++;
+                links.push({
+                    id: newId,
+                    from: op.fromId,
+                    to: op.toId,
+                    bandwidth: op.bandwidth,
+                    delay: op.delay,
+                    enabled: true
+                });
+                break;
+            }
+            case 'disable_device': {
+                links.forEach(l => {
+                    if (l.from === op.deviceId || l.to === op.deviceId) {
+                        l.enabled = false;
+                    }
+                });
+                break;
+            }
+        }
+    });
+
+    recalculateRoutes();
+    rerouteAffectedFlows();
+    calculatePartitions();
+    updateTrafficList();
+    updateLinkCongestion();
+    updatePropertyPanel();
+
+    document.getElementById('ciApplyBtn').style.display = 'none';
+    document.getElementById('ciRevertBtn').style.display = 'inline-block';
+
+    const historyData = {
+        operations: ciChangeOperations,
+        riskLevel: ciAnalysisResult.riskLevel,
+        affectedFlows: ciAnalysisResult.affectedFlows,
+        overloadedLinks: ciAnalysisResult.overloadedLinks,
+        slaChanges: ciAnalysisResult.slaChanges,
+        partitionChange: ciAnalysisResult.partitionChange,
+        preSnapshot: null,
+        postSnapshot: null,
+        applied: true,
+        timestamp: Date.now()
+    };
+
+    try {
+        const result = await apiRequest('/change-impact-history', {
+            method: 'POST',
+            body: JSON.stringify(historyData)
+        });
+        if (result && result.success && result.data) {
+            ciLastAppliedId = result.data.id;
+        }
+    } catch (err) {
+        console.error('保存变更历史失败:', err);
+    }
+
+    addLog(`变更已应用: ${ciChangeOperations.length}项操作, 风险等级: ${ciAnalysisResult.riskLevel}`, 'success');
+}
+
+function revertCiChanges() {
+    if (!ciPreSnapshot) {
+        alert('无可用快照进行回滚');
+        return;
+    }
+
+    if (!confirm('确认撤销变更，恢复到应用前的状态？')) return;
+
+    restoreTopologySnapshot(ciPreSnapshot);
+    ciPreSnapshot = null;
+
+    document.getElementById('ciRevertBtn').style.display = 'none';
+    document.getElementById('ciApplyBtn').style.display = 'inline-block';
+
+    addLog('变更已撤销，拓扑已恢复', 'warning');
+}
+
+async function loadCiHistory() {
+    const container = document.getElementById('ciHistoryList');
+    container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">加载中...</p>';
+
+    try {
+        const resp = await apiRequest('/change-impact-history?limit=30');
+        if (!resp || !resp.success || !resp.data || resp.data.length === 0) {
+            container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">暂无变更历史</p>';
+            return;
+        }
+
+        const riskLabels = { none: '无风险', low: '低风险', medium: '中风险', high: '高风险' };
+        let html = '';
+        resp.data.forEach(record => {
+            const time = new Date(record.timestamp).toLocaleString('zh-CN');
+            const opCount = record.operations ? record.operations.length : 0;
+            const riskLabel = riskLabels[record.riskLevel] || record.riskLevel;
+            const appliedLabel = record.applied ? '已应用' : '仅分析';
+
+            html += `
+                <div class="ci-history-item" onclick="viewCiHistoryDetail(${record.id})">
+                    <div class="ci-history-header">
+                        <span class="ci-history-risk ci-risk-${record.riskLevel}">${riskLabel}</span>
+                        <span class="ci-history-time">${time}</span>
+                    </div>
+                    <div class="ci-history-meta">
+                        ${opCount}项操作 | ${appliedLabel}
+                    </div>
+                </div>
+            `;
+        });
+        container.innerHTML = html;
+    } catch (err) {
+        console.error('加载变更历史失败:', err);
+        container.innerHTML = '<p class="hint" style="font-size:12px;color:#999;text-align:center;padding:15px;">加载失败</p>';
+    }
+}
+
+async function viewCiHistoryDetail(historyId) {
+    try {
+        const resp = await apiRequest('/change-impact-history/' + historyId);
+        if (!resp || !resp.success || !resp.data) {
+            alert('获取详情失败');
+            return;
+        }
+
+        const record = resp.data;
+        const riskLabels = { none: '无风险', low: '低风险', medium: '中风险', high: '高风险' };
+        const riskLabel = riskLabels[record.riskLevel] || record.riskLevel;
+        const time = new Date(record.timestamp).toLocaleString('zh-CN');
+
+        let detailHtml = `<div class="ci-detail-modal-content">`;
+        detailHtml += `<div class="ci-detail-header">`;
+        detailHtml += `<span class="ci-risk-badge ci-risk-${record.riskLevel}">${riskLabel}</span>`;
+        detailHtml += `<span style="margin-left:10px;">${time}</span>`;
+        detailHtml += `</div>`;
+
+        detailHtml += `<div class="ci-detail-section"><h4>变更操作</h4>`;
+        if (record.operations && record.operations.length > 0) {
+            record.operations.forEach(op => {
+                let desc = '';
+                switch (op.type) {
+                    case 'delete_link': desc = `删除链路 ${op.linkName || op.linkId}`; break;
+                    case 'modify_link_bw': desc = `${op.linkName || op.linkId} 带宽 →${op.newBandwidth}Mbps`; break;
+                    case 'add_link': desc = `新增链路 ${op.fromName || op.fromId}↔${op.toName || op.toId} ${op.bandwidth}Mbps`; break;
+                    case 'disable_device': desc = `禁用设备 ${op.deviceName || op.deviceId}`; break;
+                }
+                detailHtml += `<div class="ci-detail-op">• ${escapeHtml(desc)}</div>`;
+            });
+        } else {
+            detailHtml += '<div class="ci-detail-op">无操作</div>';
+        }
+        detailHtml += `</div>`;
+
+        detailHtml += `<div class="ci-detail-section"><h4>受影响流量</h4>`;
+        if (record.affectedFlows && record.affectedFlows.length > 0) {
+            const disconnected = record.affectedFlows.filter(f => f.status === 'disconnected');
+            const rerouted = record.affectedFlows.filter(f => f.status === 'rerouted');
+            if (disconnected.length > 0) {
+                detailHtml += `<div>断开: ${disconnected.length}条</div>`;
+                disconnected.forEach(f => {
+                    detailHtml += `<div class="ci-detail-flow">流量${f.flowId} ${escapeHtml(f.srcName)}→${escapeHtml(f.dstName)}</div>`;
+                });
+            }
+            if (rerouted.length > 0) {
+                detailHtml += `<div>重路由: ${rerouted.length}条</div>`;
+                rerouted.forEach(f => {
+                    detailHtml += `<div class="ci-detail-flow">流量${f.flowId} ${escapeHtml(f.srcName)}→${escapeHtml(f.dstName)}</div>`;
+                });
+            }
+        } else {
+            detailHtml += '<div>无</div>';
+        }
+        detailHtml += `</div>`;
+
+        detailHtml += `<div class="ci-detail-section"><h4>新增超载链路</h4>`;
+        if (record.overloadedLinks && record.overloadedLinks.length > 0) {
+            record.overloadedLinks.forEach(l => {
+                detailHtml += `<div class="ci-detail-overload">${escapeHtml(l.linkName)} (${(l.newLoadRate * 100).toFixed(1)}%)</div>`;
+            });
+        } else {
+            detailHtml += '<div>无</div>';
+        }
+        detailHtml += `</div>`;
+
+        detailHtml += `<div class="ci-detail-section"><h4>SLA违约变化</h4>`;
+        if (record.slaChanges) {
+            if (record.slaChanges.newViolations && record.slaChanges.newViolations.length > 0) {
+                detailHtml += `<div>新增违约: ${record.slaChanges.newViolations.map(v => escapeHtml(v.name)).join(', ')}</div>`;
+            }
+            if (record.slaChanges.recovered && record.slaChanges.recovered.length > 0) {
+                detailHtml += `<div>恢复达标: ${record.slaChanges.recovered.map(v => escapeHtml(v.name)).join(', ')}</div>`;
+            }
+            if ((!record.slaChanges.newViolations || record.slaChanges.newViolations.length === 0) &&
+                (!record.slaChanges.recovered || record.slaChanges.recovered.length === 0)) {
+                detailHtml += '<div>无变化</div>';
+            }
+        } else {
+            detailHtml += '<div>无变化</div>';
+        }
+        detailHtml += `</div>`;
+
+        detailHtml += `<div class="ci-detail-section"><h4>分区变化</h4>`;
+        if (record.partitionChange) {
+            const pc = record.partitionChange;
+            detailHtml += `<div>分区数: ${pc.oldCount} → ${pc.newCount}</div>`;
+        } else {
+            detailHtml += '<div>无变化</div>';
+        }
+        detailHtml += `</div>`;
+
+        detailHtml += `</div>`;
+
+        const existingModal = document.getElementById('ciDetailModal');
+        if (existingModal) existingModal.remove();
+
+        const modal = document.createElement('div');
+        modal.id = 'ciDetailModal';
+        modal.className = 'modal';
+        modal.style.display = 'block';
+        modal.innerHTML = `
+            <div class="modal-content" style="width:560px;max-height:80vh;overflow-y:auto;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                    <h3 style="margin:0;">变更影响分析详情</h3>
+                    <button class="btn-small" onclick="document.getElementById('ciDetailModal').remove();">×</button>
+                </div>
+                ${detailHtml}
+            </div>
+        `;
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.remove();
+        });
+        document.body.appendChild(modal);
+
+    } catch (err) {
+        console.error('获取变更历史详情失败:', err);
+        alert('获取详情失败');
+    }
+}
+
+window.removeCiOperation = removeCiOperation;
+window.viewCiHistoryDetail = viewCiHistoryDetail;
+
+initChangeImpactModule();
